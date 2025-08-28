@@ -1,0 +1,143 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Timetable‑Aware AI Scheduler</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root { --muted:#666; --card:#ddd; }
+    body { font-family: system-ui, Arial, sans-serif; margin: 24px; max-width: 760px }
+    input, button, textarea { font-size: 16px; padding: 8px; }
+    .row { display: flex; gap: 8px; margin: 8px 0; align-items: center; flex-wrap: wrap; }
+    .card { border: 1px solid var(--card); border-radius: 8px; padding: 12px; margin: 10px 0; }
+    .slots { display: grid; gap: 8px; }
+    .muted { color: var(--muted); font-size: 13px; }
+    .ok { color: #0a7a0a; }
+    .err { color: #a31111; white-space: pre-wrap; }
+    a { text-decoration: none; }
+  </style>
+</head>
+<body>
+  <h2>Timetable‑Aware AI Scheduler</h2>
+
+  <div class="row">
+    <button id="connect">Connect Google</button>
+    <span class="muted">First time? Click Connect, allow access, then you’ll come back here.</span>
+  </div>
+
+  <div class="card">
+    <label for="prompt">Natural‑language prompt</label>
+    <input id="prompt" style="width:100%" placeholder='e.g. "30 min with Alex & Priya next week"' />
+    <div class="row">
+      <button id="suggest">Suggest</button>
+      <span class="muted">Examples: “45 min tomorrow afternoon”, “30 min with alex@example.com next week”</span>
+    </div>
+  </div>
+
+  <div id="out"></div>
+
+<script>
+const out = document.getElementById('out');
+
+// 🔐 OAuth: round‑trip back to /ui/ after Google auth
+document.getElementById('connect').onclick = () => {
+  location.href = '/auth/start?next=/ui/';
+};
+
+document.getElementById('suggest').onclick = async () => {
+  const prompt = document.getElementById('prompt').value || '30 min next week';
+  out.innerHTML = '<div class="muted">Thinking…</div>';
+
+  try {
+    const r = await fetch('/nlp/suggest', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({prompt})
+    });
+
+    const data = await r.json();
+    if (!Array.isArray(data)) {
+      out.innerHTML = `<div class="err">${escapeHtml(JSON.stringify(data, null, 2))}</div>`;
+      return;
+    }
+
+    if (data.length === 0) {
+      out.innerHTML = '<div class="muted">No slots found in the requested window.</div>';
+      return;
+    }
+
+    out.innerHTML = '<h3>Top suggestions</h3>';
+    const wrap = document.createElement('div'); wrap.className='slots';
+
+    data.forEach(s => {
+      const card = document.createElement('div'); card.className='card';
+      const buf = s.explanation?.buffers || {pre_min: 0, post_min:0};
+      const fair = s.explanation?.fairness || {};
+      card.innerHTML = `
+        <div><strong>${escapeHtml(s.human)}</strong></div>
+        <div class="muted">${escapeHtml(s.explanation?.readable || '')}</div>
+        <div class="muted">Buffers: pre ${buf.pre_min}m / post ${buf.post_min}m</div>
+        ${fair.min_gap_minutes !== undefined ? `
+          <div class="muted">Fairness: min gap ${fair.min_gap_minutes}m • avg gap ${fair.avg_gap_minutes}m • midday ${fair.midday_closeness}</div>
+        ` : ''}
+        <div class="row">
+          <button class="book">Book</button>
+          <span class="muted">A higher fairness gap = less context switching for attendees.</span>
+        </div>
+        <div class="muted" id="conf-${s.slot.start}"></div>
+      `;
+      card.querySelector('.book').onclick = () => bookSlot(s);
+      wrap.appendChild(card);
+    });
+
+    out.appendChild(wrap);
+
+  } catch (e) {
+    out.innerHTML = `<div class="err">${escapeHtml(String(e))}</div>`;
+  }
+};
+
+async function bookSlot(s) {
+  const body = {
+    start: s.slot.start,
+    end: s.slot.end,
+    subject: 'Timetable‑Aware Meeting',
+    attendees: [], // empty = just block on my calendar
+    time_zone: Intl.DateTimeFormat().resolvedOptions().timeZone
+  };
+
+  const confEl = document.getElementById(`conf-${s.slot.start}`);
+  confEl.textContent = 'Booking…';
+
+  try {
+    const r = await fetch('/book', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+    const booked = await r.json();
+    if (booked.error) {
+      confEl.className = 'err';
+      confEl.textContent = JSON.stringify(booked, null, 2);
+      return;
+    }
+    confEl.className = 'ok';
+    confEl.innerHTML = `
+      Booked! &nbsp;
+      <a target="_blank" href="${booked.htmlLink}">Open in Calendar</a>
+      &nbsp;|&nbsp;
+      <a target="_blank" href="${booked.hangoutLink}">Join Google Meet</a>
+    `;
+  } catch (e) {
+    confEl.className = 'err';
+    confEl.textContent = 'Booking failed: ' + e;
+  }
+}
+
+function escapeHtml(s) {
+  return (s || '').toString()
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+</script>
+</body>
+</html>

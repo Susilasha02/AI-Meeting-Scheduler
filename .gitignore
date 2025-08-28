@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.venv/
+venv/
+.env
+.env.*
+*.env
+
+# OAuth / tokens / local data
+token_store.json
+google_oauth_client.json
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Build / deploy
+dist/
+build/
