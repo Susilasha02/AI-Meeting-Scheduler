@@ -21,7 +21,8 @@ load_dotenv()
 
 APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:3978")
 PORT = int(os.getenv("PORT", "3978"))
-CLIENT_FILE = "google_oauth_client.json"
+CLIENT_FILE = os.getenv("CLIENT_FILE", "/etc/secrets/google_oauth_client.json")
+
 LOCAL_TZ = os.getenv("TIME_ZONE", "UTC")
 
 # --------- stores ----------
