@@ -5,6 +5,7 @@ import re
 import traceback
 import uuid
 import zoneinfo
+import urllib.parse
 from typing import List, Dict, Tuple
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -503,7 +504,6 @@ def book(body: dict):
         subject = body.get("subject", "Timetable-Aware Meeting")
         explanation = body.get("why", "Scheduled by AI bot.")
         tz = body.get("time_zone", LOCAL_TZ)
-        organizer_email = creds.client_id if creds and hasattr(creds, "client_id") else None
 
         def to_rfc3339(x: str) -> str:
             dt = dparse.isoparse(x)
@@ -519,8 +519,27 @@ def book(body: dict):
         # After creation, patch description to include recorder link (use htmlLink if available)
         ev_id = ev.get("id")
         html_link = ev.get("htmlLink") or ""
-        # create recorder url
-        recorder_url = f"{APP_BASE_URL}/recorder/start?meeting={html_link or ev_id}&owner={organizer_email or 'organizer'}"
+        # determine a sensible owner identifier: prefer creator/organizer email, else client_id, else 'organizer'
+        organizer_email = None
+        try:
+            organizer_email = (ev.get("creator") or {}).get("email") or (ev.get("organizer") or {}).get("email")
+        except Exception:
+            organizer_email = None
+        if not organizer_email:
+            # fallback to OAuth client_id if available (not ideal but usable)
+            try:
+                creds_local = creds
+                organizer_email = getattr(creds_local, "client_id", None) or "organizer"
+            except Exception:
+                organizer_email = "organizer"
+
+        # URL-encode parameters so the query string doesn't break when htmlLink contains '?' or '&'
+        qp = urllib.parse.urlencode({
+            "meeting": html_link or ev_id or "",
+            "owner": organizer_email
+        }, safe='')
+
+        recorder_url = f"{APP_BASE_URL}/recorder/start?{qp}"
         new_description = (explanation or "") + f"\n\nRecorder / Upload transcript: {recorder_url}\n(Participants must click the link and consent to recording/transcription.)"
         try:
             patched = patch_event_description(creds, "primary", ev_id, new_description)
@@ -562,7 +581,8 @@ async def upload_recording(request: Request):
                 "mom": mom
             }
             mom_file.write_text(json.dumps(mom_record, indent=2), encoding="utf-8")
-            mom_link = f"/mom/{mom_id}"
+            # return absolute link for convenience
+            mom_link = f"{APP_BASE_URL}/mom/{mom_id}"
             return JSONResponse({"status":"ok","mom_link": mom_link, "mom": mom_record})
         else:
             form = await request.form()
