@@ -543,14 +543,22 @@ def book(body: dict):
             except Exception:
                 organizer_email = "organizer"
 
-        # URL-encode parameters so the query string doesn't break when htmlLink contains '?' or '&'
+        # Build a direct recorder link to the static page using proper quoting (no need for redirect).
+        encoded_meeting = urllib.parse.quote(html_link or ev_id or "", safe='')
+        encoded_owner = urllib.parse.quote(organizer_email or "organizer", safe='')
+        direct_recorder = f"{APP_BASE_URL}/ui/recorder.html?meeting={encoded_meeting}&owner={encoded_owner}"
+
+        # Keep a legacy recorder/start link as fallback
         qp = urllib.parse.urlencode({
             "meeting": html_link or ev_id or "",
             "owner": organizer_email
         }, safe='')
+        legacy_recorder = f"{APP_BASE_URL}/recorder/start?{qp}"
 
-        recorder_url = f"{APP_BASE_URL}/recorder/start?{qp}"
-        new_description = (explanation or "") + f"\n\nRecorder / Upload transcript: {recorder_url}\n(Participants must click the link and consent to recording/transcription.)"
+        # Put raw URLs in event description so copy-paste yields the correct target (not Google wrapper)
+        new_description = (explanation or "") + "\n\nRecorder / Upload transcript (direct link):\n" \
+                          f"{direct_recorder}\n\n(legacy compatibility link):\n{legacy_recorder}\n\n" \
+                          "(Participants must click the link and consent to recording/transcription.)"
         try:
             patched = patch_event_description(creds, "primary", ev_id, new_description)
         except Exception:
@@ -560,6 +568,7 @@ def book(body: dict):
         return {"eventId": ev.get("id"), "htmlLink": ev.get("htmlLink"), "hangoutLink": ev.get("hangoutLink")}
     except Exception as e:
         return JSONResponse({"error":"server_error","detail":str(e)}, status_code=500)
+
 
 # Robust redirect for recorder links
 @app.get("/recorder/start")
