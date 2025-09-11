@@ -6,12 +6,13 @@ import traceback
 import uuid
 import zoneinfo
 import urllib.parse
+import logging
 from typing import List, Dict, Tuple
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from fastapi import FastAPI, Body, Request, UploadFile, File, Form
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import RedirectResponse
 from dotenv import load_dotenv
@@ -44,6 +45,15 @@ UPLOADS = DATA_DIR / "uploads"
 MOMS = DATA_DIR / "moms"
 UPLOADS.mkdir(parents=True, exist_ok=True)
 MOMS.mkdir(parents=True, exist_ok=True)
+
+# set up a small logger for recorder redirect debugging
+logger = logging.getLogger("recorder_redirect")
+if not logger.handlers:
+    # avoid duplicate handlers on reload
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    logger.addHandler(ch)
+logger.setLevel(logging.INFO)
 
 # ---------- tz helpers ----------
 def to_local(dt: datetime) -> datetime:
@@ -551,19 +561,42 @@ def book(body: dict):
     except Exception as e:
         return JSONResponse({"error":"server_error","detail":str(e)}, status_code=500)
 
-from fastapi import Response
-
-# Redirect /recorder/start?meeting=...  -->  /ui/recorder.html?meeting=...
+# Robust redirect for recorder links
 @app.get("/recorder/start")
 def recorder_start_redirect(request: Request):
     """
-    Keeps compatibility with recorder links that point to /recorder/start.
-    We redirect to the static recorder page under /ui/recorder.html, preserving the query string.
+    Robust handler for recorder links:
+     - Logs incoming url for debugging.
+     - Preserves raw querystring and redirects to absolute /ui/recorder.html?...
+     - If no querystring, tries to extract a 'q=' fragment (defensive).
+     - If still no params, serves static recorder.html directly.
     """
-    qs = request.url.query  # already a string like: "meeting=...&owner=..."
-    target = "/ui/recorder.html"
+    try:
+        logger.info("recorder_start incoming_url: %s", str(request.url))
+    except Exception:
+        pass
+
+    qs = request.url.query  # raw querystring (percent-encoded)
+    if not qs:
+        raw = str(request.url)
+        if "q=" in raw:
+            after_q = raw.split("q=", 1)[1]
+            after_q = after_q.split("&", 1)[0]
+            qs = after_q
+
+    target = f"{APP_BASE_URL}/ui/recorder.html"
     if qs:
         target = f"{target}?{qs}"
+
+    if not qs:
+        # fallback to serving the static file directly
+        try:
+            file_path = Path("static") / "recorder.html"
+            if file_path.exists():
+                return FileResponse(str(file_path), media_type="text/html")
+        except Exception:
+            pass
+
     return RedirectResponse(url=target)
 
 
