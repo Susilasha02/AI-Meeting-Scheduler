@@ -551,6 +551,22 @@ def book(body: dict):
     except Exception as e:
         return JSONResponse({"error":"server_error","detail":str(e)}, status_code=500)
 
+from fastapi import Response
+
+# Redirect /recorder/start?meeting=...  -->  /ui/recorder.html?meeting=...
+@app.get("/recorder/start")
+def recorder_start_redirect(request: Request):
+    """
+    Keeps compatibility with recorder links that point to /recorder/start.
+    We redirect to the static recorder page under /ui/recorder.html, preserving the query string.
+    """
+    qs = request.url.query  # already a string like: "meeting=...&owner=..."
+    target = "/ui/recorder.html"
+    if qs:
+        target = f"{target}?{qs}"
+    return RedirectResponse(url=target)
+
+
 # Recorder / upload endpoint
 @app.post("/upload-recording")
 async def upload_recording(request: Request):
