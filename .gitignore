@@ -22,3 +22,5 @@ Thumbs.db
 # Build / deploy
 dist/
 build/
+/data/
+

@@ -1,9 +1,16 @@
-import os, json, re, traceback, zoneinfo
+# app.py (updated)
+import os
+import json
+import re
+import traceback
+import uuid
+import zoneinfo
 from typing import List, Dict, Tuple
 from datetime import datetime, timedelta
+from pathlib import Path
 
-from fastapi import FastAPI, Body, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Body, Request, UploadFile, File, Form
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import RedirectResponse
 from dotenv import load_dotenv
@@ -19,7 +26,7 @@ import dateparser  # pip install dateparser
 
 load_dotenv()
 
-APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:3978")
+APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:3978").rstrip("/")
 PORT = int(os.getenv("PORT", "3978"))
 CLIENT_FILE = os.getenv("CLIENT_FILE", "/etc/secrets/google_oauth_client.json")
 
@@ -29,6 +36,13 @@ LOCAL_TZ = os.getenv("TIME_ZONE", "UTC")
 TOKEN_STORE = "token_store.json"
 CONTACTS_STORE = "contacts.json"
 ORGANIZER_ID = "organizer"
+
+# Data dirs
+DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
+UPLOADS = DATA_DIR / "uploads"
+MOMS = DATA_DIR / "moms"
+UPLOADS.mkdir(parents=True, exist_ok=True)
+MOMS.mkdir(parents=True, exist_ok=True)
 
 # ---------- tz helpers ----------
 def to_local(dt: datetime) -> datetime:
@@ -136,6 +150,16 @@ def insert_event(creds: Credentials, calendar_id: str, subject: str,
         f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events",
         params=params,
         json=event,
+        timeout=20
+    )
+    r.raise_for_status()
+    return r.json()
+
+def patch_event_description(creds: Credentials, calendar_id: str, event_id: str, new_description: str):
+    sess = _authed(creds)
+    r = sess.patch(
+        f"https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events/{event_id}",
+        json={"description": new_description},
         timeout=20
     )
     r.raise_for_status()
@@ -279,6 +303,37 @@ def parse_prompt(prompt: str, contacts: Dict[str,str]) -> Dict:
         "window_end":   rfc3339(end),
     }
 
+# ---------- new: search window helper for 'today' mode ----------
+def get_search_window_from_prompt(prompt: str, days_ahead: int = 7) -> Tuple[datetime, datetime]:
+    """
+    If prompt contains 'today' (case-insensitive), returns now..end_of_today in LOCAL_TZ.
+    Otherwise returns now .. now + days_ahead.
+    """
+    tz = zoneinfo.ZoneInfo(LOCAL_TZ)
+    now = datetime.now(tz)
+    if "today" in (prompt or "").lower():
+        start = now
+        end = datetime(now.year, now.month, now.day, 23, 59, 59, tzinfo=tz)
+    else:
+        start = now
+        end = now + timedelta(days=days_ahead)
+    # convert to UTC-naive ISO for compatibility with freebusy (we use rfc3339 anyway)
+    return start, end
+
+# ---------- summarizer for MoM ----------
+def summarize_transcript(transcript: str, max_sentences: int = 6):
+    import re
+    sentences = re.split(r'(?<=[.!?])\s+', transcript.strip())
+    summary = ' '.join(sentences[:max_sentences]).strip()
+    actions = []
+    for s in sentences:
+        s_strip = s.strip()
+        if re.match(r'(?i)^(action|todo|task|follow up|follow-up|please|assign|will|should)\b', s_strip) or \
+           any(k in s_strip.lower() for k in ['action:', 'todo', 'follow up', 'please', 'should', 'will']):
+            actions.append(s_strip)
+    actions = list(dict.fromkeys(actions))
+    return {"summary": summary, "action_items": actions or []}
+
 # ---------- FastAPI ----------
 app = FastAPI()
 app.mount("/ui", StaticFiles(directory="static", html=True), name="static")
@@ -341,11 +396,19 @@ def nlp_suggest(body: dict = Body(...)):
 # Core suggest
 @app.post("/suggest")
 def suggest(body: dict = Body(default={})):
+    """
+    Body can include:
+      - duration_min, buffer_min
+      - attendees: list of emails (or ["primary"])
+      - window_start / window_end (RFC3339)
+      - OR: prompt and today_only: true/false
+    """
     creds = load_creds(ORGANIZER_ID)
     if not creds:
         return JSONResponse({"error": "not_connected"}, status_code=401)
 
     try:
+        # duration / buffer
         duration_min = int(body.get("duration_min", 45))
         buffer_min   = int(body.get("buffer_min", 15))
 
@@ -354,17 +417,30 @@ def suggest(body: dict = Body(default={})):
         if not attendees:
             attendees = ["primary"]
 
+        # compute window: either explicit window OR derived from prompt + today_only
         start_iso = body.get("window_start")
         end_iso   = body.get("window_end")
+        prompt_text = body.get("prompt", "")
+        today_only_flag = bool(body.get("today_only", False))
+
         if start_iso and end_iso:
             start = dparse.isoparse(start_iso)
             end   = dparse.isoparse(end_iso)
         else:
-            now = datetime.utcnow()
-            start = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
-            end   = (now + timedelta(days=5)).replace(hour=18, minute=30, second=0, microsecond=0)
+            if prompt_text:
+                if today_only_flag:
+                    # clamp to today in LOCAL_TZ
+                    start_dt, end_dt = get_search_window_from_prompt(prompt_text, days_ahead=0)
+                else:
+                    start_dt, end_dt = get_search_window_from_prompt(prompt_text, days_ahead=7)
+                start = start_dt.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
+                end = end_dt.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
+            else:
+                now = datetime.utcnow()
+                start = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+                end   = (now + timedelta(days=5)).replace(hour=18, minute=30, second=0, microsecond=0)
 
-        # proper RFC3339
+        # call freebusy
         fb = freebusy(creds, attendees, rfc3339(start), rfc3339(end))
 
         busy_lists = [[{"start":b["start"], "end":b["end"]} for b in fb[cal]] for cal in fb]
@@ -390,6 +466,8 @@ def suggest(body: dict = Body(default={})):
             }})
             resp.append({
                 "slot": sl,
+                "start": sl["start"],
+                "end": sl["end"],
                 "human": f"{pretty(start_dt)} → {pretty(end_dt)}",
                 "explanation": why,
                 "score": round(score, 3)
@@ -408,6 +486,14 @@ def suggest(body: dict = Body(default={})):
 # Book
 @app.post("/book")
 def book(body: dict):
+    """
+    Expects:
+      - start (ISO), end (ISO)
+      - attendees: list of emails
+      - subject (optional)
+      - why (optional)
+    After creating event, patch description to include recorder link.
+    """
     creds = load_creds(ORGANIZER_ID)
     if not creds:
         return JSONResponse({"error": "not_connected"}, status_code=401)
@@ -417,6 +503,7 @@ def book(body: dict):
         subject = body.get("subject", "Timetable-Aware Meeting")
         explanation = body.get("why", "Scheduled by AI bot.")
         tz = body.get("time_zone", LOCAL_TZ)
+        organizer_email = creds.client_id if creds and hasattr(creds, "client_id") else None
 
         def to_rfc3339(x: str) -> str:
             dt = dparse.isoparse(x)
@@ -428,6 +515,87 @@ def book(body: dict):
             to_rfc3339(s), to_rfc3339(e), attendees,
             description=explanation, add_meet=True, time_zone=tz
         )
+
+        # After creation, patch description to include recorder link (use htmlLink if available)
+        ev_id = ev.get("id")
+        html_link = ev.get("htmlLink") or ""
+        # create recorder url
+        recorder_url = f"{APP_BASE_URL}/recorder/start?meeting={html_link or ev_id}&owner={organizer_email or 'organizer'}"
+        new_description = (explanation or "") + f"\n\nRecorder / Upload transcript: {recorder_url}\n(Participants must click the link and consent to recording/transcription.)"
+        try:
+            patched = patch_event_description(creds, "primary", ev_id, new_description)
+        except Exception:
+            # if patch fails, we silently continue — event was created successfully
+            patched = None
+
         return {"eventId": ev.get("id"), "htmlLink": ev.get("htmlLink"), "hangoutLink": ev.get("hangoutLink")}
     except Exception as e:
         return JSONResponse({"error":"server_error","detail":str(e)}, status_code=500)
+
+# Recorder / upload endpoint
+@app.post("/upload-recording")
+async def upload_recording(request: Request):
+    """
+    Accepts:
+      - JSON { meeting, owner, transcript }
+      - multipart/form-data with 'meeting', 'owner', and 'audio' file
+    Returns: JSON with mom_link or saved filename
+    """
+    try:
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            payload = await request.json()
+            transcript = payload.get("transcript", "")
+            meeting = payload.get("meeting")
+            owner = payload.get("owner")
+            if not transcript:
+                return JSONResponse({"error":"no_transcript"}, status_code=400)
+            mom = summarize_transcript(transcript)
+            mom_id = str(uuid.uuid4())
+            mom_file = MOMS / f"{mom_id}.json"
+            mom_record = {
+                "id": mom_id,
+                "meeting": meeting,
+                "owner": owner,
+                "created_at": datetime.utcnow().isoformat() + "Z",
+                "transcript": transcript,
+                "mom": mom
+            }
+            mom_file.write_text(json.dumps(mom_record, indent=2), encoding="utf-8")
+            mom_link = f"/mom/{mom_id}"
+            return JSONResponse({"status":"ok","mom_link": mom_link, "mom": mom_record})
+        else:
+            form = await request.form()
+            meeting = form.get("meeting")
+            owner = form.get("owner")
+            audio_file = form.get("audio")
+            if not audio_file:
+                return JSONResponse({"error":"no_audio"}, status_code=400)
+            fname = f"{uuid.uuid4()}_{getattr(audio_file, 'filename', 'upload.webm')}"
+            dest = UPLOADS / fname
+            contents = await audio_file.read()
+            dest.write_bytes(contents)
+            # Server-side transcription is not included here to keep free tier usage simple.
+            return JSONResponse({"status":"ok","saved": str(dest)})
+    except Exception as e:
+        return JSONResponse({"error":"server_error","detail":str(e), "trace": traceback.format_exc()}, status_code=500)
+
+# MoM view
+@app.get("/mom/{mom_id}", response_class=HTMLResponse)
+def get_mom(mom_id: str):
+    mom_file = MOMS / f"{mom_id}.json"
+    if not mom_file.exists():
+        return HTMLResponse("<h3>MoM not found</h3>", status_code=404)
+    mom_record = json.loads(mom_file.read_text(encoding="utf-8"))
+    html = f"<div style='font-family:Inter,Arial;padding:18px;max-width:900px;margin:20px auto;'>"
+    html += f"<h2>Minutes of Meeting</h2><p><strong>Meeting:</strong> {mom_record.get('meeting')}</p>"
+    html += f"<p><strong>Owner:</strong> {mom_record.get('owner')}</p>"
+    html += f"<h3>Summary</h3><p>{mom_record['mom']['summary']}</p>"
+    html += "<h3>Action Items</h3><ul>"
+    for a in mom_record['mom']['action_items']:
+        html += f"<li>{a}</li>"
+    html += "</ul>"
+    html += f"<hr><p><em>Created at {mom_record.get('created_at')}</em></p></div>"
+    return HTMLResponse(html)
+
+# run with uvicorn externally (Procfile / render start command)
