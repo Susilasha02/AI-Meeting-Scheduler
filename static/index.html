@@ -2,142 +2,199 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Timetable‑Aware AI Scheduler</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Recorder — Timetable AI Scheduler</title>
   <style>
-    :root { --muted:#666; --card:#ddd; }
-    body { font-family: system-ui, Arial, sans-serif; margin: 24px; max-width: 760px }
-    input, button, textarea { font-size: 16px; padding: 8px; }
-    .row { display: flex; gap: 8px; margin: 8px 0; align-items: center; flex-wrap: wrap; }
-    .card { border: 1px solid var(--card); border-radius: 8px; padding: 12px; margin: 10px 0; }
-    .slots { display: grid; gap: 8px; }
-    .muted { color: var(--muted); font-size: 13px; }
-    .ok { color: #0a7a0a; }
-    .err { color: #a31111; white-space: pre-wrap; }
-    a { text-decoration: none; }
+    body{font-family:Inter,system-ui,Arial; background:#f6f8fb; margin:0; padding:20px;}
+    .card{max-width:820px;margin:32px auto;padding:20px;background:#fff;border-radius:12px;box-shadow:0 10px 30px rgba(2,6,23,0.06);}
+    h2{margin:0 0 8px;}
+    .hint{color:#6b7280;margin-bottom:12px;}
+    button{padding:10px 14px;border-radius:8px;border:0;background:#4f46e5;color:#fff;font-weight:600;cursor:pointer;}
+    button.secondary{background:#fff;color:#4f46e5;border:1px solid #e6e9ef;}
+    textarea{width:100%;min-height:120px;border-radius:8px;border:1px solid #e6e9ef;padding:12px;font-size:14px;margin-top:12px;}
+    .row{display:flex;gap:12px;align-items:center;margin-top:12px;}
+    .meta{font-size:13px;color:#6b7280;margin-top:8px;}
   </style>
 </head>
 <body>
-  <h2>Timetable‑Aware AI Scheduler</h2>
-
-  <div class="row">
-    <button id="connect">Connect Google</button>
-    <span class="muted">First time? Click Connect, allow access, then you’ll come back here.</span>
-  </div>
-
   <div class="card">
-    <label for="prompt">Natural‑language prompt</label>
-    <input id="prompt" style="width:100%" placeholder='e.g. "30 min with Alex & Priya next week"' />
+    <h2>Record / Transcribe meeting (optional)</h2>
+    <div class="hint">This page can record audio (you must give microphone permission). Transcript is generated in the browser when supported, then sent to the server to create Minutes of Meeting (MoM). Recording & transcription require your consent — action is explicit and local to your browser.</div>
+
+    <div id="info" class="meta"></div>
+
     <div class="row">
-      <button id="suggest">Suggest</button>
-      <span class="muted">Examples: “45 min tomorrow afternoon”, “30 min with alex@example.com next week”</span>
+      <button id="startBtn">Start Recording</button>
+      <button id="stopBtn" class="secondary" disabled>Stop</button>
+      <button id="uploadBtn" class="secondary" disabled>Upload Transcript</button>
+    </div>
+
+    <div id="status" class="meta"></div>
+
+    <div>
+      <label style="display:block;margin-top:12px;font-weight:600">Transcript (editable)</label>
+      <textarea id="transcript" placeholder="Transcript will appear here after recording..."></textarea>
+    </div>
+
+    <div style="margin-top:12px">
+      <label class="meta">Meeting id / link (auto filled from query):</label>
+      <div id="meetingInfo" class="meta"></div>
     </div>
   </div>
 
-  <div id="out"></div>
-
 <script>
-const out = document.getElementById('out');
+/*
+ recorder.html logic:
+ - Uses Web Speech API (SpeechRecognition) for in-browser transcription if available.
+ - Uses MediaRecorder to capture audio as a fallback and allow upload.
+ - After stop, transcript is placed in textarea; user can edit then click Upload Transcript to POST to /upload-recording.
+*/
 
-// 🔐 OAuth: round‑trip back to /ui/ after Google auth
-document.getElementById('connect').onclick = () => {
-  location.href = '/auth/start?next=/ui/';
-};
+const urlParams = new URLSearchParams(window.location.search);
+const meeting = urlParams.get('meeting') || '';
+const owner = urlParams.get('owner') || '';
+const meetingInfoEl = document.getElementById('meetingInfo');
+meetingInfoEl.textContent = meeting ? meeting : 'No meeting id supplied';
 
-document.getElementById('suggest').onclick = async () => {
-  const prompt = document.getElementById('prompt').value || '30 min next week';
-  out.innerHTML = '<div class="muted">Thinking…</div>';
-
-  try {
-    const r = await fetch('/nlp/suggest', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({prompt})
-    });
-
-    const data = await r.json();
-    if (!Array.isArray(data)) {
-      out.innerHTML = `<div class="err">${escapeHtml(JSON.stringify(data, null, 2))}</div>`;
-      return;
-    }
-
-    if (data.length === 0) {
-      out.innerHTML = '<div class="muted">No slots found in the requested window.</div>';
-      return;
-    }
-
-    out.innerHTML = '<h3>Top suggestions</h3>';
-    const wrap = document.createElement('div'); wrap.className='slots';
-
-    data.forEach(s => {
-      const card = document.createElement('div'); card.className='card';
-      const buf = s.explanation?.buffers || {pre_min: 0, post_min:0};
-      const fair = s.explanation?.fairness || {};
-      card.innerHTML = `
-        <div><strong>${escapeHtml(s.human)}</strong></div>
-        <div class="muted">${escapeHtml(s.explanation?.readable || '')}</div>
-        <div class="muted">Buffers: pre ${buf.pre_min}m / post ${buf.post_min}m</div>
-        ${fair.min_gap_minutes !== undefined ? `
-          <div class="muted">Fairness: min gap ${fair.min_gap_minutes}m • avg gap ${fair.avg_gap_minutes}m • midday ${fair.midday_closeness}</div>
-        ` : ''}
-        <div class="row">
-          <button class="book">Book</button>
-          <span class="muted">A higher fairness gap = less context switching for attendees.</span>
-        </div>
-        <div class="muted" id="conf-${s.slot.start}"></div>
-      `;
-      card.querySelector('.book').onclick = () => bookSlot(s);
-      wrap.appendChild(card);
-    });
-
-    out.appendChild(wrap);
-
-  } catch (e) {
-    out.innerHTML = `<div class="err">${escapeHtml(String(e))}</div>`;
-  }
-};
-
-async function bookSlot(s) {
-  const body = {
-    start: s.slot.start,
-    end: s.slot.end,
-    subject: 'Timetable‑Aware Meeting',
-    attendees: [], // empty = just block on my calendar
-    time_zone: Intl.DateTimeFormat().resolvedOptions().timeZone
-  };
-
-  const confEl = document.getElementById(`conf-${s.slot.start}`);
-  confEl.textContent = 'Booking…';
-
-  try {
-    const r = await fetch('/book', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify(body)
-    });
-    const booked = await r.json();
-    if (booked.error) {
-      confEl.className = 'err';
-      confEl.textContent = JSON.stringify(booked, null, 2);
-      return;
-    }
-    confEl.className = 'ok';
-    confEl.innerHTML = `
-      Booked! &nbsp;
-      <a target="_blank" href="${booked.htmlLink}">Open in Calendar</a>
-      &nbsp;|&nbsp;
-      <a target="_blank" href="${booked.hangoutLink}">Join Google Meet</a>
-    `;
-  } catch (e) {
-    confEl.className = 'err';
-    confEl.textContent = 'Booking failed: ' + e;
-  }
+const infoEl = document.getElementById('info');
+if(!navigator.mediaDevices) {
+  infoEl.textContent = 'Note: your browser may not support microphone capture.';
 }
 
-function escapeHtml(s) {
-  return (s || '').toString()
-    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
+let recorder, audioChunks = [];
+let recognition, transcriptText = '';
+
+const startBtn = document.getElementById('startBtn');
+const stopBtn  = document.getElementById('stopBtn');
+const uploadBtn = document.getElementById('uploadBtn');
+const statusEl = document.getElementById('status');
+const txEl = document.getElementById('transcript');
+
+startBtn.onclick = async () => {
+  statusEl.textContent = 'Initializing...';
+  // Try to init SpeechRecognition (browser API)
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if(SpeechRecognition){
+    recognition = new SpeechRecognition();
+    recognition.lang = 'en-IN';
+    recognition.interimResults = true;
+    recognition.continuous = true;
+    transcriptText = '';
+    recognition.onresult = (ev) => {
+      let interim = '';
+      for (let i = ev.resultIndex; i < ev.results.length; i++) {
+        const res = ev.results[i];
+        if(res.isFinal) transcriptText += res[0].transcript + ' ';
+        else interim += res[0].transcript;
+      }
+      txEl.value = transcriptText + interim;
+    };
+    recognition.onerror = (e) => {
+      console.warn('SpeechRecognition error', e);
+      statusEl.textContent = 'Speech recognition error: ' + e.error;
+    };
+    recognition.start();
+    statusEl.textContent = 'Recording & transcribing (browser) — microphone active.';
+  } else {
+    // No SpeechRecognition: fallback to audio-only capture
+    try{
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      recorder = new MediaRecorder(stream);
+      audioChunks = [];
+      recorder.ondataavailable = (e) => audioChunks.push(e.data);
+      recorder.onstop = () => {
+        const blob = new Blob(audioChunks, { type: 'audio/webm' });
+        // create a download link for user if they want:
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = 'meeting_audio.webm';
+        a.textContent = 'Download audio';
+        statusEl.innerHTML = 'Audio recorded. You can upload transcript or download audio: '; statusEl.appendChild(a);
+        // send to server as file upload (disabled until user clicks)
+        uploadBtn.dataset.blobUrl = url;
+        uploadBtn.disabled = false;
+      };
+      recorder.start();
+      statusEl.textContent = 'Audio recording (no browser transcription).';
+    }catch(err){
+      console.error(err);
+      statusEl.textContent = 'Microphone permission denied or error: ' + err.message;
+    }
+  }
+
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+};
+
+stopBtn.onclick = () => {
+  if(recognition) {
+    recognition.stop();
+    statusEl.textContent = 'Transcription stopped. Edit transcript if needed and click Upload Transcript.';
+    txEl.value = txEl.value.trim();
+    uploadBtn.disabled = false;
+  }
+  if(recorder){
+    recorder.stop();
+  }
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+};
+
+uploadBtn.onclick = async () => {
+  statusEl.textContent = 'Uploading…';
+  const transcript = txEl.value.trim();
+  if(transcript) {
+    // Send transcript JSON
+    try{
+      const res = await fetch('/upload-recording', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({
+          meeting: meeting,
+          owner: owner,
+          transcript: transcript
+        })
+      });
+      const data = await res.json();
+      if(res.ok){
+        statusEl.textContent = 'Uploaded transcript. Generated MoM link: ' + (data.mom_link || 'none');
+        alert('MoM created — check your calendar/notifications or MoM link: ' + (data.mom_link || 'none'));
+      } else {
+        statusEl.textContent = 'Upload failed: ' + (data.error||JSON.stringify(data));
+      }
+    }catch(e){
+      statusEl.textContent = 'Network error: ' + e.message;
+    }
+    return;
+  }
+
+  // If no transcript but audio blob exists, upload audio file
+  if(uploadBtn.dataset.blobUrl){
+    const blob = await fetch(uploadBtn.dataset.blobUrl).then(r=>r.blob());
+    const fd = new FormData();
+    fd.append('meeting', meeting);
+    fd.append('owner', owner);
+    fd.append('audio', blob, 'meeting_audio.webm');
+    try{
+      const res = await fetch('/upload-recording', {
+        method:'POST',
+        body: fd
+      });
+      const data = await res.json();
+      if(res.ok){
+        statusEl.textContent = 'Uploaded audio; transcription & MoM will be processed server-side.';
+        alert('MoM request received — check back later.');
+      } else {
+        statusEl.textContent = 'Upload failed: ' + (data.error||JSON.stringify(data));
+      }
+    }catch(e){
+      statusEl.textContent = 'Network error: ' + e.message;
+    }
+    return;
+  }
+
+  statusEl.textContent = 'Nothing to upload — please record first.';
+};
 </script>
 </body>
 </html>
