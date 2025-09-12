@@ -609,56 +609,115 @@ def recorder_start_redirect(request: Request):
     return RedirectResponse(url=target)
 
 
-# Recorder / upload endpoint
+# ---------- Recorder / upload endpoint (updated) ----------
 @app.post("/upload-recording")
 async def upload_recording(request: Request):
     """
     Accepts:
-      - JSON { meeting, owner, transcript }
-      - multipart/form-data with 'meeting', 'owner', and 'audio' file
-    Returns: JSON with mom_link or saved filename
+      - JSON { meeting, owner, participant_email, transcript, final (opt) }
+      - multipart/form-data with 'meeting', 'owner', 'participant_email', and 'audio' file
+    Behavior:
+      - Stores per-meeting aggregated data in MOMS/<meeting_hash>.json (participants -> transcripts)
+      - Saves uploaded audio blobs to data/uploads/
+      - Returns {"status":"ok","mom_link": "..."} when transcript(s) exist
     """
     try:
+        def meeting_hash(meeting_url: str) -> str:
+            # create a short filesystem-safe hash/identifier for a meeting URL
+            import hashlib
+            return hashlib.sha256(meeting_url.encode("utf-8")).hexdigest()[:16]
+
         content_type = request.headers.get("content-type", "")
         if "application/json" in content_type:
             payload = await request.json()
-            transcript = payload.get("transcript", "")
             meeting = payload.get("meeting")
             owner = payload.get("owner")
+            participant = payload.get("participant_email") or owner or "unknown"
+            transcript = payload.get("transcript", "")
+            final = bool(payload.get("final", True))
+
+            if not meeting:
+                return JSONResponse({"error": "no_meeting"}, status_code=400)
             if not transcript:
-                return JSONResponse({"error":"no_transcript"}, status_code=400)
-            mom = summarize_transcript(transcript)
-            mom_id = str(uuid.uuid4())
-            mom_file = MOMS / f"{mom_id}.json"
+                return JSONResponse({"error": "no_transcript"}, status_code=400)
+
+            mid = meeting_hash(meeting)
+            mom_file = MOMS / f"meeting_{mid}.json"
+            if mom_file.exists():
+                record = json.loads(mom_file.read_text(encoding="utf-8"))
+            else:
+                record = {
+                    "meeting": meeting,
+                    "owner": owner,
+                    "created_at": datetime.utcnow().isoformat() + "Z",
+                    "participants": {},   # email -> { transcripts: [ ... ], audio_files: [] }
+                }
+
+            part = record["participants"].setdefault(participant, {"transcripts": [], "audio_files": []})
+            part["transcripts"].append({
+                "text": transcript,
+                "uploaded_at": datetime.utcnow().isoformat() + "Z",
+                "final": final
+            })
+            mom_file.write_text(json.dumps(record, indent=2), encoding="utf-8")
+
+            # optionally produce a short MoM immediately (summarizer used for whole meeting)
+            # We'll generate a combined summary by concatenating participant transcripts.
+            combined_text = "\n\n".join(
+                " ".join([t.get("text","") for t in rec.get("transcripts",[])])
+                for rec in record["participants"].values()
+            )
+            mom = summarize_transcript(combined_text)
+            mom_id = f"meeting_{mid}"
+            mom_path = MOMS / f"{mom_id}.json"
             mom_record = {
                 "id": mom_id,
                 "meeting": meeting,
                 "owner": owner,
                 "created_at": datetime.utcnow().isoformat() + "Z",
-                "transcript": transcript,
+                "participants": record["participants"],
                 "mom": mom
             }
-            mom_file.write_text(json.dumps(mom_record, indent=2), encoding="utf-8")
-            # return absolute link for convenience
+            mom_path.write_text(json.dumps(mom_record, indent=2), encoding="utf-8")
             mom_link = f"{APP_BASE_URL}/mom/{mom_id}"
             return JSONResponse({"status":"ok","mom_link": mom_link, "mom": mom_record})
+
         else:
+            # form / multipart flow: upload audio blob + meeting + participant_email
             form = await request.form()
             meeting = form.get("meeting")
             owner = form.get("owner")
+            participant = form.get("participant_email") or owner or "unknown"
             audio_file = form.get("audio")
+            if not meeting:
+                return JSONResponse({"error":"no_meeting"}, status_code=400)
             if not audio_file:
                 return JSONResponse({"error":"no_audio"}, status_code=400)
+
+            # save audio
             fname = f"{uuid.uuid4()}_{getattr(audio_file, 'filename', 'upload.webm')}"
             dest = UPLOADS / fname
             contents = await audio_file.read()
             dest.write_bytes(contents)
-            # Server-side transcription is not included here to keep free tier usage simple.
+
+            # update meeting record (participants -> audio_files)
+            mid = meeting_hash(meeting)
+            mom_file = MOMS / f"meeting_{mid}.json"
+            if mom_file.exists():
+                record = json.loads(mom_file.read_text(encoding="utf-8"))
+            else:
+                record = {"meeting": meeting, "owner": owner, "created_at": datetime.utcnow().isoformat() + "Z", "participants": {}}
+            part = record["participants"].setdefault(participant, {"transcripts": [], "audio_files": []})
+            part["audio_files"].append({"path": str(dest), "uploaded_at": datetime.utcnow().isoformat() + "Z"})
+            mom_file.write_text(json.dumps(record, indent=2), encoding="utf-8")
+
             return JSONResponse({"status":"ok","saved": str(dest)})
+
     except Exception as e:
         return JSONResponse({"error":"server_error","detail":str(e), "trace": traceback.format_exc()}, status_code=500)
 
-# MoM view
+
+# ---------- MoM view (updated to show participants + transcripts) ----------
 @app.get("/mom/{mom_id}", response_class=HTMLResponse)
 def get_mom(mom_id: str):
     mom_file = MOMS / f"{mom_id}.json"
@@ -668,12 +727,20 @@ def get_mom(mom_id: str):
     html = f"<div style='font-family:Inter,Arial;padding:18px;max-width:900px;margin:20px auto;'>"
     html += f"<h2>Minutes of Meeting</h2><p><strong>Meeting:</strong> {mom_record.get('meeting')}</p>"
     html += f"<p><strong>Owner:</strong> {mom_record.get('owner')}</p>"
-    html += f"<h3>Summary</h3><p>{mom_record['mom']['summary']}</p>"
+    html += f"<h3>Summary</h3><p>{mom_record.get('mom',{}).get('summary','(no summary)')}</p>"
     html += "<h3>Action Items</h3><ul>"
-    for a in mom_record['mom']['action_items']:
+    for a in mom_record.get('mom',{}).get('action_items', []):
         html += f"<li>{a}</li>"
-    html += "</ul>"
-    html += f"<hr><p><em>Created at {mom_record.get('created_at')}</em></p></div>"
+    html += "</ul><hr>"
+    html += "<h3>Participant transcripts & files</h3>"
+    for p_email, pdata in mom_record.get('participants', {}).items():
+        html += f"<h4>{p_email}</h4>"
+        for i, t in enumerate(pdata.get('transcripts', [])):
+            text = t.get('text','')
+            uploaded = t.get('uploaded_at','')
+            html += f"<div style='border:1px solid #eee;padding:8px;margin-bottom:6px;'><strong>Transcript #{i+1} ({uploaded})</strong><pre style='white-space:pre-wrap;font-family:inherit'>{text}</pre></div>"
+        for af in pdata.get('audio_files', []):
+            path = af.get('path')
+            html += f"<div>Audio file: <code>{path}</code></div>"
+    html += f"<hr><p><em>Generated at {mom_record.get('created_at')}</em></p></div>"
     return HTMLResponse(html)
-
-# run with uvicorn externally (Procfile / render start command)
