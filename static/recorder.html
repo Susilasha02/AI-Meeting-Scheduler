@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Recorder / Upload transcript</title>
+  <style>
+    :root{
+      --card-bg:#fff; --muted:#6b7280; --accent:#6d28d9;
+      --surface:#f7f7fb; --radius:14px; font-family: Inter, Arial, sans-serif;
+    }
+    body{ background: linear-gradient(180deg,#f6f7fb, #eef2f7); margin:0; padding:28px; }
+    .card{ max-width:960px; margin:30px auto; background:var(--card-bg); border-radius:var(--radius); box-shadow:0 8px 30px rgba(15,15,30,0.06); padding:22px; }
+    h1{ margin:0 0 6px; font-size:22px;}
+    p.lead{ color:var(--muted); margin:6px 0 18px; }
+    .controls{ display:flex; gap:8px; align-items:center; margin-bottom:10px; }
+    button{ background:var(--accent); color:white; border:none; padding:10px 14px; border-radius:10px; cursor:pointer; font-weight:600; }
+    button.ghost{ background:transparent; color:var(--accent); border:1.5px solid rgba(109,40,217,0.12); }
+    textarea{ width:100%; min-height:150px; border-radius:10px; padding:12px; border:1px solid #e6e6ef; font-family:monospace; resize:vertical; }
+    .muted{ color:var(--muted); font-size:13px; margin-top:8px; }
+    .notice{ background:#fbfbff; border-left:4px solid rgba(109,40,217,0.16); padding:10px; margin:12px 0; border-radius:8px; color:#333;}
+    .result{ margin-top:14px; padding:10px; background:#f3f7ff; border-radius:8px; color:#08306b; }
+    .small{ font-size:13px; color:var(--muted) }
+    a.link{ color:var(--accent); text-decoration:none; font-weight:600 }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Record / Transcribe meeting (optional)</h1>
+    <p class="lead">This page accepts a transcript (manual or browser-generated) and uploads it to the server to create a Minutes of Meeting (MoM).</p>
+
+    <div class="controls">
+      <button id="btnStart" class="ghost">Paste Transcript</button>
+      <button id="btnUpload" class="">Upload transcript</button>
+      <div style="margin-left:auto" id="status"></div>
+    </div>
+
+    <div class="notice">
+      Uploaded transcript will be summarized into a short MoM and action items. The server keeps summaries in <code>/mom/</code>.
+    </div>
+
+    <label class="small">Transcript (editable)</label>
+    <textarea id="transcript" placeholder="Transcript will appear here after recording or paste it here..."></textarea>
+
+    <div class="muted" id="meetingInfo">Meeting: —</div>
+    <div class="muted" id="ownerInfo">Owner: —</div>
+
+    <div id="result" class="result" style="display:none"></div>
+  </div>
+
+<script>
+(function(){
+  // parse query params robustly (handles URL-encoded meeting values)
+  function getQuery() {
+    const q = {};
+    const raw = location.search.replace(/^\?/, '');
+    if (!raw) return q;
+    raw.split('&').forEach(p=>{
+      const idx = p.indexOf('=');
+      if (idx<0) return;
+      const k = decodeURIComponent(p.slice(0, idx));
+      const v = decodeURIComponent(p.slice(idx+1));
+      q[k] = v;
+    });
+    return q;
+  }
+
+  const q = getQuery();
+  const meeting = q.meeting || q.event || '';
+  const owner = q.owner || '';
+
+  const elMeeting = document.getElementById('meetingInfo');
+  const elOwner = document.getElementById('ownerInfo');
+  const elTranscript = document.getElementById('transcript');
+  const elResult = document.getElementById('result');
+  const btnUpload = document.getElementById('btnUpload');
+  const btnStart = document.getElementById('btnStart');
+  const status = document.getElementById('status');
+
+  elMeeting.textContent = 'Meeting: ' + (meeting || 'No meeting supplied');
+  elOwner.textContent = 'Owner: ' + (owner || 'Unknown');
+
+  // helper to set status
+  function setStatus(t){ status.textContent = t; setTimeout(()=>status.textContent='',3000); }
+
+  // quick paste action
+  btnStart.addEventListener('click', async ()=>{
+    // try clipboard (if allowed) otherwise focus textarea
+    try{
+      const txt = await navigator.clipboard.readText();
+      if (txt && txt.length>10){
+        elTranscript.value = txt;
+        setStatus('Pasted from clipboard');
+        return;
+      }
+    }catch(e){}
+    elTranscript.focus();
+  });
+
+  // upload transcript (POST JSON)
+  btnUpload.addEventListener('click', async ()=>{
+    const transcript = elTranscript.value.trim();
+    if (!transcript || transcript.length < 8){
+      alert('Please paste or write a transcript before uploading.');
+      return;
+    }
+    setStatus('Uploading...');
+    try{
+      const payload = { meeting: meeting, owner: owner, transcript: transcript };
+      const r = await fetch('/upload-recording', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify(payload)
+      });
+      const j = await r.json();
+      if (r.ok && j.status === 'ok'){
+        let info = 'MoM created: ' + (j.mom_link || j.mom?.id || '—');
+        elResult.style.display = 'block';
+        elResult.innerHTML = '<strong>OK</strong><div style="margin-top:8px"><a class="link" href="'+ (j.mom_link || '#') +'" target="_blank">Open MoM</a></div>';
+        setStatus('Done');
+      } else {
+        const err = j.error || j.detail || JSON.stringify(j);
+        elResult.style.display = 'block';
+        elResult.innerText = 'Upload failed: ' + err;
+        setStatus('Error');
+      }
+    }catch(err){
+      elResult.style.display = 'block';
+      elResult.innerText = 'Upload failed: ' + err;
+      setStatus('Error');
+    }
+  });
+
+  // convenience: if meeting param contains "calendar" (a full google link),
+  // show a decoded friendly version below.
+  if (meeting && meeting.length>0){
+    try {
+      const decoded = decodeURIComponent(meeting);
+      if (decoded !== meeting) {
+        elMeeting.textContent = 'Meeting: ' + decoded;
+      }
+    } catch(e){}
+  }
+})();
+</script>
+</body>
+</html>
