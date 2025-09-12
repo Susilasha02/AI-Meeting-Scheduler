@@ -1,147 +1,263 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Recorder / Upload transcript</title>
-  <style>
-    :root{
-      --card-bg:#fff; --muted:#6b7280; --accent:#6d28d9;
-      --surface:#f7f7fb; --radius:14px; font-family: Inter, Arial, sans-serif;
-    }
-    body{ background: linear-gradient(180deg,#f6f7fb, #eef2f7); margin:0; padding:28px; }
-    .card{ max-width:960px; margin:30px auto; background:var(--card-bg); border-radius:var(--radius); box-shadow:0 8px 30px rgba(15,15,30,0.06); padding:22px; }
-    h1{ margin:0 0 6px; font-size:22px;}
-    p.lead{ color:var(--muted); margin:6px 0 18px; }
-    .controls{ display:flex; gap:8px; align-items:center; margin-bottom:10px; }
-    button{ background:var(--accent); color:white; border:none; padding:10px 14px; border-radius:10px; cursor:pointer; font-weight:600; }
-    button.ghost{ background:transparent; color:var(--accent); border:1.5px solid rgba(109,40,217,0.12); }
-    textarea{ width:100%; min-height:150px; border-radius:10px; padding:12px; border:1px solid #e6e6ef; font-family:monospace; resize:vertical; }
-    .muted{ color:var(--muted); font-size:13px; margin-top:8px; }
-    .notice{ background:#fbfbff; border-left:4px solid rgba(109,40,217,0.16); padding:10px; margin:12px 0; border-radius:8px; color:#333;}
-    .result{ margin-top:14px; padding:10px; background:#f3f7ff; border-radius:8px; color:#08306b; }
-    .small{ font-size:13px; color:var(--muted) }
-    a.link{ color:var(--accent); text-decoration:none; font-weight:600 }
-  </style>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Recorder / Upload transcript</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+<style>
+  body { font-family: Inter, Arial, sans-serif; background: linear-gradient(180deg,#f6f9fc,#f1f5f9); margin:0; min-height:100vh; color:#111; }
+  .card { max-width: 980px; margin:48px auto; background:white; border-radius:14px; box-shadow:0 8px 30px rgba(20,20,40,0.06); padding:28px; }
+  h1 { margin:0 0 12px; font-size:22px;}
+  p.lead { color:#6b7280; margin:8px 0 18px; }
+  .btn { display:inline-block; padding:10px 16px; border-radius:10px; border:0; cursor:pointer; font-weight:600; }
+  .btn-primary { background:#6d28d9; color:white; box-shadow:0 6px 18px rgba(109,40,217,0.12); }
+  .btn-ghost { background:transparent; border:1px solid #e6e6ea; color:#111}
+  textarea { width:100%; min-height:180px; border-radius:8px; border:1px solid #e6e6ea; padding:12px; font-family:monospace; resize:vertical; }
+  .meta { margin-top:12px; color:#6b7280; font-size:13px; }
+  .row { display:flex; gap:10px; align-items:center; }
+  .field { flex:1; display:flex; gap:8px; align-items:center; }
+  .input { padding:10px 12px; border:1px solid #e6e6ea; border-radius:8px; width:100%; }
+  .small { font-size:13px; color:#374151; }
+  .label { color:#374151; font-weight:600; margin-bottom:6px; display:block;}
+  .hint { color:#6b7280; font-size:13px; }
+  .participant { width:300px; }
+  .controls { margin-top:12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .ok { color:#059669; font-weight:600; }
+  .warn { color:#b91c1c; font-weight:600; }
+  .status { margin-top:10px; font-size:13px; color:#374151;}
+  .file-note { font-size:12px; color:#6b7280; margin-top:6px;}
+  code { background:#fafafa; padding:4px 6px; border-radius:6px; }
+</style>
 </head>
 <body>
-  <div class="card">
+  <div class="card" role="main">
     <h1>Record / Transcribe meeting (optional)</h1>
-    <p class="lead">This page accepts a transcript (manual or browser-generated) and uploads it to the server to create a Minutes of Meeting (MoM).</p>
+    <p class="lead">This page accepts a transcript (manual or browser-generated) and uploads it to the server to create a Minutes of Meeting (MoM). You can also record audio and upload blobs. Participants must consent — recording is local to your browser until uploaded.</p>
+
+    <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px;">
+      <div style="flex:1;">
+        <label class="label">Meeting (from query)</label>
+        <div id="meetingUrl" class="hint">No meeting supplied</div>
+      </div>
+      <div style="width:280px;">
+        <label class="label">Participant email</label>
+        <input id="participantEmail" class="input participant" placeholder="alice@example.com"/>
+        <div class="file-note">Owner from event link will be prefilled if present.</div>
+      </div>
+    </div>
 
     <div class="controls">
-      <button id="btnStart" class="ghost">Paste Transcript</button>
-      <button id="btnUpload" class="">Upload transcript</button>
-      <div style="margin-left:auto" id="status"></div>
+      <button id="startBtn" class="btn btn-primary">Start Recording</button>
+      <button id="stopBtn" class="btn btn-ghost" disabled>Stop</button>
+      <button id="pasteBtn" class="btn btn-ghost">Paste Transcript</button>
+      <button id="uploadBtn" class="btn btn-primary" style="background:#4338ca">Upload transcript</button>
+      <label style="display:inline-flex;align-items:center" class="hint">
+        <input id="uploadAudioFile" type="file" accept="audio/*" style="display:none"/>
+        <button id="selectAudioBtn" class="btn btn-ghost">Upload audio file</button>
+      </label>
     </div>
 
-    <div class="notice">
-      Uploaded transcript will be summarized into a short MoM and action items. The server keeps summaries in <code>/mom/</code>.
-    </div>
+    <div id="status" class="status"></div>
 
-    <label class="small">Transcript (editable)</label>
+    <h3 style="margin-top:18px;">Transcript (editable)</h3>
     <textarea id="transcript" placeholder="Transcript will appear here after recording or paste it here..."></textarea>
 
-    <div class="muted" id="meetingInfo">Meeting: —</div>
-    <div class="muted" id="ownerInfo">Owner: —</div>
+    <div style="display:flex;gap:12px;align-items:center;margin-top:10px;">
+      <div class="meta">Uploaded transcript will be summarized into a short MoM and action items. The server keeps summaries in <code>/mom/</code>.</div>
+    </div>
 
-    <div id="result" class="result" style="display:none"></div>
+    <div style="margin-top:14px" class="meta">
+      <div id="resultBox"></div>
+    </div>
+
   </div>
 
 <script>
-(function(){
-  // parse query params robustly (handles URL-encoded meeting values)
-  function getQuery() {
-    const q = {};
-    const raw = location.search.replace(/^\?/, '');
-    if (!raw) return q;
-    raw.split('&').forEach(p=>{
-      const idx = p.indexOf('=');
-      if (idx<0) return;
-      const k = decodeURIComponent(p.slice(0, idx));
-      const v = decodeURIComponent(p.slice(idx+1));
-      q[k] = v;
-    });
-    return q;
+  // helper: read query params
+  function qp(name) {
+    const params = new URLSearchParams(window.location.search);
+    return params.get(name);
   }
 
-  const q = getQuery();
-  const meeting = q.meeting || q.event || '';
-  const owner = q.owner || '';
-
-  const elMeeting = document.getElementById('meetingInfo');
-  const elOwner = document.getElementById('ownerInfo');
-  const elTranscript = document.getElementById('transcript');
-  const elResult = document.getElementById('result');
-  const btnUpload = document.getElementById('btnUpload');
-  const btnStart = document.getElementById('btnStart');
-  const status = document.getElementById('status');
-
-  elMeeting.textContent = 'Meeting: ' + (meeting || 'No meeting supplied');
-  elOwner.textContent = 'Owner: ' + (owner || 'Unknown');
-
-  // helper to set status
-  function setStatus(t){ status.textContent = t; setTimeout(()=>status.textContent='',3000); }
-
-  // quick paste action
-  btnStart.addEventListener('click', async ()=>{
-    // try clipboard (if allowed) otherwise focus textarea
-    try{
-      const txt = await navigator.clipboard.readText();
-      if (txt && txt.length>10){
-        elTranscript.value = txt;
-        setStatus('Pasted from clipboard');
-        return;
-      }
-    }catch(e){}
-    elTranscript.focus();
-  });
-
-  // upload transcript (POST JSON)
-  btnUpload.addEventListener('click', async ()=>{
-    const transcript = elTranscript.value.trim();
-    if (!transcript || transcript.length < 8){
-      alert('Please paste or write a transcript before uploading.');
-      return;
-    }
-    setStatus('Uploading...');
-    try{
-      const payload = { meeting: meeting, owner: owner, transcript: transcript };
-      const r = await fetch('/upload-recording', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify(payload)
-      });
-      const j = await r.json();
-      if (r.ok && j.status === 'ok'){
-        let info = 'MoM created: ' + (j.mom_link || j.mom?.id || '—');
-        elResult.style.display = 'block';
-        elResult.innerHTML = '<strong>OK</strong><div style="margin-top:8px"><a class="link" href="'+ (j.mom_link || '#') +'" target="_blank">Open MoM</a></div>';
-        setStatus('Done');
-      } else {
-        const err = j.error || j.detail || JSON.stringify(j);
-        elResult.style.display = 'block';
-        elResult.innerText = 'Upload failed: ' + err;
-        setStatus('Error');
-      }
-    }catch(err){
-      elResult.style.display = 'block';
-      elResult.innerText = 'Upload failed: ' + err;
-      setStatus('Error');
-    }
-  });
-
-  // convenience: if meeting param contains "calendar" (a full google link),
-  // show a decoded friendly version below.
-  if (meeting && meeting.length>0){
+  // populate meeting + owner from query
+  const meetingEl = document.getElementById('meetingUrl');
+  const partEl = document.getElementById('participantEmail');
+  const meetingQS = qp('meeting');
+  const ownerQS = qp('owner');
+  if (meetingQS) {
     try {
-      const decoded = decodeURIComponent(meeting);
-      if (decoded !== meeting) {
-        elMeeting.textContent = 'Meeting: ' + decoded;
-      }
-    } catch(e){}
+      // if encoded, decode
+      meetingEl.textContent = decodeURIComponent(meetingQS);
+      meetingEl.dataset.raw = decodeURIComponent(meetingQS);
+    } catch(e) {
+      meetingEl.textContent = meetingQS;
+      meetingEl.dataset.raw = meetingQS;
+    }
   }
-})();
+  if (ownerQS) {
+    try { partEl.value = decodeURIComponent(ownerQS); } catch(e){ partEl.value = ownerQS; }
+  }
+
+  // UI elements
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const pasteBtn = document.getElementById('pasteBtn');
+  const uploadBtn = document.getElementById('uploadBtn');
+  const transcriptEl = document.getElementById('transcript');
+  const statusEl = document.getElementById('status');
+  const resultBox = document.getElementById('resultBox');
+  const selectAudioBtn = document.getElementById('selectAudioBtn');
+  const uploadAudioFile = document.getElementById('uploadAudioFile');
+
+  // recording + media
+  let mediaRecorder = null;
+  let recordedChunks = [];
+  let recognition = null;
+  let usingSpeechAPI = false;
+
+  // Web Speech API live transcription (best-effort)
+  function startSpeechRecognition() {
+    if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) return false;
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    recognition = new SR();
+    recognition.lang = 'en-US';
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.onresult = (ev) => {
+      let final = '';
+      let interim = '';
+      for (let i = ev.resultIndex; i < ev.results.length; i++){
+        const r = ev.results[i];
+        if (r.isFinal) final += r[0].transcript + ' ';
+        else interim += r[0].transcript + ' ';
+      }
+      transcriptEl.value = (transcriptEl.value + ' ' + final + ' ' + interim).trim();
+    };
+    recognition.onerror = (e) => {
+      console.warn('Speech recognition error', e);
+    };
+    recognition.onend = () => {
+      // auto-restart if we are still recording
+      if (mediaRecorder && mediaRecorder.state === 'recording') {
+        try { recognition.start(); } catch(e){ }
+      }
+    };
+    recognition.start();
+    usingSpeechAPI = true;
+    return true;
+  }
+
+  async function startRecording() {
+    statusEl.textContent = 'Requesting microphone permission...';
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      recordedChunks = [];
+      mediaRecorder = new MediaRecorder(stream);
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+      };
+      mediaRecorder.onstart = () => {
+        statusEl.textContent = 'Recording...';
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+      };
+      mediaRecorder.onstop = () => {
+        statusEl.textContent = 'Recording stopped. You can upload the audio or paste/trim transcript.';
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+      };
+      mediaRecorder.start();
+      // try Web Speech API
+      startSpeechRecognition();
+    } catch (err) {
+      console.error(err);
+      statusEl.innerHTML = '<span class="warn">Microphone access denied or not available.</span>';
+    }
+  }
+
+  function stopRecording() {
+    if (recognition) {
+      try { recognition.stop(); } catch(e){}
+      recognition = null;
+      usingSpeechAPI = false;
+    }
+    if (mediaRecorder && mediaRecorder.state === 'recording') {
+      mediaRecorder.stop();
+    }
+  }
+
+  startBtn.addEventListener('click', startRecording);
+  stopBtn.addEventListener('click', stopRecording);
+
+  pasteBtn.addEventListener('click', async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      transcriptEl.value = (transcriptEl.value + '\n' + text).trim();
+      statusEl.textContent = 'Pasted from clipboard';
+    } catch (e) {
+      statusEl.textContent = 'Could not read clipboard — paste manually.';
+    }
+  });
+
+  selectAudioBtn.addEventListener('click', ()=> uploadAudioFile.click());
+
+  uploadAudioFile.addEventListener('change', async (ev) => {
+    const f = ev.target.files[0];
+    if (!f) return;
+    const meeting = meetingEl.dataset.raw || meetingQS;
+    if (!meeting) { statusEl.textContent = 'Meeting query param missing'; return; }
+    const participant = (partEl.value || '').trim();
+    const fd = new FormData();
+    fd.append('meeting', meeting);
+    fd.append('owner', ownerQS || '');
+    fd.append('participant_email', participant);
+    fd.append('audio', f, f.name);
+    statusEl.textContent = 'Uploading audio...';
+    try {
+      const r = await fetch('/upload-recording', { method:'POST', body: fd });
+      const j = await r.json();
+      if (j.status === 'ok') {
+        statusEl.innerHTML = '<span class="ok">Audio uploaded</span>';
+        if (j.mom_link) resultBox.innerHTML = `Generated MoM link: <a href="${j.mom_link}" target="_blank">${j.mom_link}</a>`;
+      } else {
+        statusEl.textContent = 'Upload error: ' + (j.error || JSON.stringify(j));
+      }
+    } catch (e) {
+      statusEl.textContent = 'Upload failed: ' + e.message;
+    }
+  });
+
+  uploadBtn.addEventListener('click', async () => {
+    const meeting = meetingEl.dataset.raw || meetingQS;
+    if (!meeting) { statusEl.textContent = 'Meeting query param missing. Provide meeting in URL as ?meeting=...'; return; }
+    const transcript = transcriptEl.value.trim();
+    if (!transcript) { statusEl.textContent = 'Transcript is empty. Paste or record first.'; return; }
+    const participant = (partEl.value || '').trim();
+    statusEl.textContent = 'Uploading transcript...';
+    try {
+      const payload = {
+        meeting: meeting,
+        owner: ownerQS || '',
+        participant_email: participant || '',
+        transcript: transcript,
+        final: true
+      };
+      const r = await fetch('/upload-recording', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+      const j = await r.json();
+      if (j.status === 'ok') {
+        statusEl.innerHTML = '<span class="ok">Transcript uploaded & MoM generated.</span>';
+        if (j.mom_link) resultBox.innerHTML = `Generated MoM link: <a href="${j.mom_link}" target="_blank">${j.mom_link}</a>`;
+      } else {
+        statusEl.textContent = 'Upload error: ' + (j.error || JSON.stringify(j));
+      }
+    } catch (e) {
+      statusEl.textContent = 'Upload failed: ' + e.message;
+    }
+  });
+
+  // enable/disable stop/start depending on recorder state initialization
+  stopBtn.disabled = true;
 </script>
 </body>
 </html>
