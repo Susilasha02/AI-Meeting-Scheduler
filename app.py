@@ -271,16 +271,83 @@ def _next_week_bounds() -> Tuple[datetime, datetime]:
     monday = (now + timedelta(days=(7 - now.weekday()))).replace(hour=9, minute=0, second=0, microsecond=0)
     friday = (monday + timedelta(days=4)).replace(hour=18, minute=30, second=0, microsecond=0)
     return monday, friday
+# --- improved parsing utilities (replace existing parse_prompt & get_search_window_from_prompt) ---
+from dateutil import tz
+from dateparser.search import search_dates
 
-def parse_prompt(prompt: str, contacts: Dict[str,str]) -> Dict:
-    p = prompt.strip()
+DUR_RE2 = re.compile(r"(\d+(?:\.\d+)?)\s*(hours|hour|hrs|hr|h|minutes|min|mins)", re.I)
+TIME_OF_DAY_RE = re.compile(r"\b(\d{1,2}(:\d{2})?\s*(?:am|pm|AM|PM)?)\b")
 
-    dur=45
-    m = DUR_RE.search(p)
-    if m:
-        n=int(m.group(1)); unit=m.group(2).lower()
-        dur = n*60 if unit.startswith('h') else n
+def _parse_duration_minutes(prompt: str, default_min: int = 45) -> int:
+    """Return duration in minutes. Handles floats like 1.5 hours too."""
+    m = DUR_RE2.search(prompt)
+    if not m:
+        return default_min
+    val = float(m.group(1))
+    unit = m.group(2).lower()
+    if unit.startswith("h"):  # hours
+        return int(round(val * 60))
+    return int(round(val))    # minutes
 
+def _choose_time_for_date(parsed_dt: datetime, prompt: str) -> datetime:
+    """
+    If the parsed datetime lacks a time (00:00 or has no hour/minute), prefer:
+     - if prompt includes 'morning' -> 09:00
+     - 'afternoon' -> 14:00
+     - 'evening' -> 18:00
+     - explicit time in prompt -> use that
+     - otherwise keep parsed_dt as-is (dateparser often supplies time)
+    """
+    # If datetime has time component not midnight, keep it
+    if parsed_dt.hour != 0 or parsed_dt.minute != 0 or parsed_dt.second != 0:
+        return parsed_dt
+
+    p_low = prompt.lower()
+    now = datetime.utcnow()
+    if "morning" in p_low:
+        return parsed_dt.replace(hour=9, minute=0, second=0, microsecond=0)
+    if "afternoon" in p_low:
+        return parsed_dt.replace(hour=14, minute=0, second=0, microsecond=0)
+    if "evening" in p_low:
+        return parsed_dt.replace(hour=18, minute=0, second=0, microsecond=0)
+
+    # check for explicit time string
+    tm = TIME_OF_DAY_RE.search(prompt)
+    if tm:
+        try:
+            tstr = tm.group(1)
+            # parse time via dateparser using today's date as base
+            dt = dateparser.parse(tstr, settings={"PREFER_DATES_FROM": "future", "RELATIVE_BASE": now})
+            if dt:
+                return parsed_dt.replace(hour=dt.hour, minute=dt.minute, second=0, microsecond=0)
+        except Exception:
+            pass
+
+    # default to 09:00 if only date provided and no hint
+    return parsed_dt.replace(hour=9, minute=0, second=0, microsecond=0)
+
+def parse_prompt(prompt: str, contacts: Dict[str, str]) -> Dict:
+    """
+    Returns:
+      {
+        "attendees": [...],
+        "duration_min": int,
+        "buffer_min": int,
+        "window_start": rfc3339_iso,
+        "window_end": rfc3339_iso
+      }
+    This replaces the older parse_prompt. It tries:
+      - extract explicit duration
+      - find a date/time expression via dateparser.search.search_dates()
+      - if a date/time found: use it as the meeting start (apply reasonable default times)
+      - otherwise, if words like 'today'/'tomorrow'/weekday exist, compute window accordingly
+      - finally fallback to next-day window as previously
+    """
+    p = (prompt or "").strip()
+    duration_min = _parse_duration_minutes(p, default_min=45)
+    buffer_min = 15
+
+    # attendees handling (same as before)
     attendees = set(EMAIL_RE.findall(p))
     for w in re.findall(r"[A-Za-z]+", p):
         key = w.lower()
@@ -289,48 +356,140 @@ def parse_prompt(prompt: str, contacts: Dict[str,str]) -> Dict:
     if not attendees:
         attendees = {"primary"}
 
-    start=None; end=None
-    p_low = p.lower()
-    if "next week" in p_low:
-        start, end = _next_week_bounds()
-    elif "tomorrow" in p_low:
-        base = datetime.utcnow() + timedelta(days=1)
-        start = base.replace(hour=9, minute=0, second=0, microsecond=0)
-        end   = base.replace(hour=18, minute=30, second=0, microsecond=0)
-    else:
-        dp = dateparser.parse(p, settings={"RETURN_AS_TIMEZONE_AWARE": False})
-        if dp:
-            start = dp.replace(hour=9, minute=0, second=0, microsecond=0)
-            end   = dp.replace(hour=18, minute=30, second=0, microsecond=0)
-    if not start or not end:
-        now = datetime.utcnow()
-        start = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
-        end   = (now + timedelta(days=5)).replace(hour=18, minute=30, second=0, microsecond=0)
-
-    return {
-        "attendees": sorted(attendees),
-        "duration_min": dur,
-        "buffer_min": 15,
-        "window_start": rfc3339(start),
-        "window_end":   rfc3339(end),
+    # try to find explicit date/time in text
+    settings = {
+        "PREFER_DATES_FROM": "future",
+        "RELATIVE_BASE": datetime.utcnow(),
+        "RETURN_AS_TIMEZONE_AWARE": False,
+        "STRICT_PARSING": False
     }
 
-# ---------- new: search window helper for 'today' mode ----------
+    found = None
+    try:
+        # search_dates returns list of (text, datetime)
+        sd = search_dates(p, settings=settings, languages=None)
+        if sd:
+            # choose the first meaningful date-like match that isn't just a time token
+            for txt, dt in sd:
+                if txt and len(txt.strip()) >= 2:
+                    found = dt
+                    break
+    except Exception:
+        found = None
+
+    # special-word handling (today/tomorrow/next week/next wednesday)
+    p_low = p.lower()
+    tzinfo_local = zoneinfo.ZoneInfo(LOCAL_TZ)
+    if found:
+        # If found has only date part (time midnight), pick a sensible time
+        start_dt = _choose_time_for_date(found, p)
+        # make naive UTC time for compatibility with rest of app (rfc3339 expects aware->UTC)
+        # treat start_dt as local time -> convert to UTC naive
+        if start_dt.tzinfo is None:
+            # interpret as LOCAL_TZ then convert to UTC naive
+            start_local = start_dt.replace(tzinfo=tzinfo_local)
+            start_utc = start_local.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
+        else:
+            start_utc = start_dt.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
+        end_utc = start_utc + timedelta(minutes=duration_min)
+        return {
+            "attendees": sorted(attendees),
+            "duration_min": duration_min,
+            "buffer_min": buffer_min,
+            "window_start": rfc3339(start_utc),
+            "window_end": rfc3339(end_utc),
+        }
+
+    # fallback: interpret keywords
+    if "today" in p_low:
+        now_local = datetime.now(tzinfo_local)
+        start_local = now_local
+        # put meeting soon: choose next available slot at current time + buffer or 30 mins
+        start_utc = start_local.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
+        end_utc = start_utc + timedelta(minutes=duration_min)
+        return {
+            "attendees": sorted(attendees),
+            "duration_min": duration_min,
+            "buffer_min": buffer_min,
+            "window_start": rfc3339(start_utc),
+            "window_end": rfc3339(end_utc),
+        }
+    if "tomorrow" in p_low:
+        base = datetime.now(tzinfo_local) + timedelta(days=1)
+        start_local = base.replace(hour=9, minute=0, second=0, microsecond=0)
+        start_utc = start_local.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
+        end_utc = start_utc + timedelta(minutes=duration_min)
+        return {
+            "attendees": sorted(attendees),
+            "duration_min": duration_min,
+            "buffer_min": buffer_min,
+            "window_start": rfc3339(start_utc),
+            "window_end": rfc3339(end_utc),
+        }
+
+    if any(k in p_low for k in ["next week", "next month"]):
+        # re-use previous logic to pick next week window
+        start_dt, end_dt = _next_week_bounds()
+        return {
+            "attendees": sorted(attendees),
+            "duration_min": duration_min,
+            "buffer_min": buffer_min,
+            "window_start": rfc3339(start_dt),
+            "window_end": rfc3339(end_dt),
+        }
+
+    # No date/time found - fall back to same-day rolling window logic as before:
+    now = datetime.utcnow()
+    start = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+    end   = (now + timedelta(days=5)).replace(hour=18, minute=30, second=0, microsecond=0)
+    return {
+        "attendees": sorted(attendees),
+        "duration_min": duration_min,
+        "buffer_min": buffer_min,
+        "window_start": rfc3339(start),
+        "window_end": rfc3339(end),
+    }
+
+
 def get_search_window_from_prompt(prompt: str, days_ahead: int = 7) -> Tuple[datetime, datetime]:
     """
-    If prompt contains 'today' (case-insensitive), returns now..end_of_today in LOCAL_TZ.
-    Otherwise returns now .. now + days_ahead.
+    Improved search window determination:
+      - if prompt contains 'today' -> now .. end_of_today (LOCAL_TZ)
+      - if prompt contains 'tomorrow' -> start_of_tomorrow .. end_of_tomorrow
+      - if prompt contains a weekday or explicit date -> return that date .. that date + 1 day
+      - otherwise return now .. now + days_ahead
     """
     tz = zoneinfo.ZoneInfo(LOCAL_TZ)
     now = datetime.now(tz)
-    if "today" in (prompt or "").lower():
+    p_low = (prompt or "").lower()
+    if "today" in p_low:
         start = now
         end = datetime(now.year, now.month, now.day, 23, 59, 59, tzinfo=tz)
-    else:
-        start = now
-        end = now + timedelta(days=days_ahead)
-    # convert to UTC-naive ISO for compatibility with freebusy (we use rfc3339 anyway)
-    return start, end
+        return start, end
+    if "tomorrow" in p_low:
+        tomorrow = now + timedelta(days=1)
+        start = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 0, 0, 0, tzinfo=tz)
+        end = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 23, 59, 59, tzinfo=tz)
+        return start, end
+
+    # try to detect a date expression using dateparser.search
+    try:
+        sd = search_dates(prompt or "", settings={"PREFER_DATES_FROM": "future", "RELATIVE_BASE": datetime.utcnow()})
+        if sd:
+            # use the first match
+            dt = sd[0][1]
+            # if the parsed dt is date-only, pick the whole date
+            start_local = dt.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=tz) if dt.hour==0 and dt.minute==0 else dt
+            # ensure tz-aware local then return
+            if start_local.tzinfo is None:
+                start_local = start_local.replace(tzinfo=tz)
+            end_local = start_local + timedelta(days=1)
+            return start_local, end_local
+    except Exception:
+        pass
+
+    # default window
+    return now, now + timedelta(days=days_ahead)
 
 # ---------- summarizer for MoM ----------
 def summarize_transcript(transcript: str, max_sentences: int = 6):
