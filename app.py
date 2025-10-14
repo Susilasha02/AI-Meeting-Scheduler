@@ -26,6 +26,7 @@ from google.auth.transport.requests import AuthorizedSession
 from dateutil import parser as dparse
 import dateparser  # pip install dateparser
 
+
 load_dotenv()
 
 APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:3978").rstrip("/")
@@ -346,7 +347,29 @@ def summarize_transcript(transcript: str, max_sentences: int = 6):
     return {"summary": summary, "action_items": actions or []}
 
 # ---------- FastAPI ----------
+from fastapi.middleware.cors import CORSMiddleware
+
 app = FastAPI()
+
+# Add CORS if needed (Teams iframe context)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Serve static with Teams-friendly headers
+from fastapi.responses import Response
+@app.middleware("http")
+async def add_teams_headers(request, call_next):
+    response: Response = await call_next(request)
+    response.headers["X-Frame-Options"] = "ALLOWALL"
+    response.headers["Content-Security-Policy"] = "frame-ancestors 'self' https://teams.microsoft.com https://*.teams.microsoft.com"
+    return response
+
+
 app.mount("/ui", StaticFiles(directory="static", html=True), name="static")
 
 @app.get("/")

@@ -1,263 +1,289 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Recorder / Upload transcript</title>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
-<style>
-  body { font-family: Inter, Arial, sans-serif; background: linear-gradient(180deg,#f6f9fc,#f1f5f9); margin:0; min-height:100vh; color:#111; }
-  .card { max-width: 980px; margin:48px auto; background:white; border-radius:14px; box-shadow:0 8px 30px rgba(20,20,40,0.06); padding:28px; }
-  h1 { margin:0 0 12px; font-size:22px;}
-  p.lead { color:#6b7280; margin:8px 0 18px; }
-  .btn { display:inline-block; padding:10px 16px; border-radius:10px; border:0; cursor:pointer; font-weight:600; }
-  .btn-primary { background:#6d28d9; color:white; box-shadow:0 6px 18px rgba(109,40,217,0.12); }
-  .btn-ghost { background:transparent; border:1px solid #e6e6ea; color:#111}
-  textarea { width:100%; min-height:180px; border-radius:8px; border:1px solid #e6e6ea; padding:12px; font-family:monospace; resize:vertical; }
-  .meta { margin-top:12px; color:#6b7280; font-size:13px; }
-  .row { display:flex; gap:10px; align-items:center; }
-  .field { flex:1; display:flex; gap:8px; align-items:center; }
-  .input { padding:10px 12px; border:1px solid #e6e6ea; border-radius:8px; width:100%; }
-  .small { font-size:13px; color:#374151; }
-  .label { color:#374151; font-weight:600; margin-bottom:6px; display:block;}
-  .hint { color:#6b7280; font-size:13px; }
-  .participant { width:300px; }
-  .controls { margin-top:12px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-  .ok { color:#059669; font-weight:600; }
-  .warn { color:#b91c1c; font-weight:600; }
-  .status { margin-top:10px; font-size:13px; color:#374151;}
-  .file-note { font-size:12px; color:#6b7280; margin-top:6px;}
-  code { background:#fafafa; padding:4px 6px; border-radius:6px; }
-</style>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Recorder — AI Meeting Scheduler</title>
+  <style>
+    /* Full-page, Teams-friendly, centered frame */
+    :root {
+      --bg: #f6f8fb;
+      --card: #fff;
+      --accent: #6f46f6;
+      --muted: #6b7280;
+      --radius: 14px;
+      --maxwidth: 1100px;
+    }
+    html,body { height:100%; margin:0; font-family:Inter,system-ui,Segoe UI,Roboto,"Helvetica Neue",Arial; background:var(--bg); color:#111; }
+    .wrap { min-height:100%; display:flex; align-items:center; justify-content:center; padding:32px; box-sizing:border-box; }
+    .card { width:100%; max-width:var(--maxwidth); background:var(--card); border-radius:var(--radius); padding:28px; box-shadow:0 6px 30px rgba(23,25,33,0.06); }
+    .header { display:flex; align-items:center; gap:12px; margin-bottom:16px; }
+    .logo { width:56px; height:56px; border-radius:10px; background:linear-gradient(135deg,#6f46f6,#b794f4); display:flex; align-items:center; justify-content:center; color:white; font-weight:700; font-size:18px; }
+    h1 { margin:0; font-size:20px; }
+    p.lead { margin:6px 0 18px; color:var(--muted); font-size:14px; }
+    .controls { display:flex; gap:12px; align-items:center; margin-bottom:18px; }
+    button { padding:10px 16px; border-radius:10px; border:0; cursor:pointer; font-weight:600; }
+    .btn-primary { background:var(--accent); color:white; }
+    .btn-ghost { background:transparent; color:var(--accent); border:1px solid rgba(111,70,246,0.12); }
+    .status { color:var(--muted); font-size:13px; }
+    .wave { width:100%; height:86px; background:linear-gradient(180deg,#f8fafc,#fff); border-radius:10px; border:1px dashed #e6e9ef; display:flex; align-items:center; justify-content:center; color:#9aa3b2; margin-bottom:18px; }
+    .transcript { max-height:260px; overflow:auto; padding:12px; background:#fafbff; border-radius:10px; border:1px solid #eef2ff; color:#111; font-size:14px; line-height:1.45; }
+    .muted { color:var(--muted); font-size:13px; }
+  </style>
 </head>
 <body>
-  <div class="card" role="main">
-    <h1>Record / Transcribe meeting (optional)</h1>
-    <p class="lead">This page accepts a transcript (manual or browser-generated) and uploads it to the server to create a Minutes of Meeting (MoM). You can also record audio and upload blobs. Participants must consent — recording is local to your browser until uploaded.</p>
-
-    <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px;">
-      <div style="flex:1;">
-        <label class="label">Meeting (from query)</label>
-        <div id="meetingUrl" class="hint">No meeting supplied</div>
+  <div class="wrap">
+    <div class="card" role="main">
+      <div class="header">
+        <div class="logo">TS</div>
+        <div>
+          <h1>Meeting Recorder</h1>
+          <p class="lead">Automatically records meeting audio and generates transcript / MoM. Auto-starts when possible — click to give microphone permission if required.</p>
+        </div>
       </div>
-      <div style="width:280px;">
-        <label class="label">Participant email</label>
-        <input id="participantEmail" class="input participant" placeholder="alice@example.com"/>
-        <div class="file-note">Owner from event link will be prefilled if present.</div>
+
+      <div class="controls">
+        <button id="btnStart" class="btn-primary">Start Recording</button>
+        <button id="btnStop" class="btn-ghost" disabled>Stop</button>
+        <div class="status" id="status">Idle</div>
+      </div>
+
+      <div class="wave" id="wave">Mic status: waiting for input…</div>
+
+      <div class="muted">Live Transcript</div>
+      <div class="transcript" id="transcript">No transcript yet.</div>
+
+      <div style="height:14px;"></div>
+      <div class="muted">Upload / Save</div>
+      <div style="margin-top:10px;">
+        <button id="uploadBtn" class="btn-ghost" disabled>Upload Audio & Transcript</button>
       </div>
     </div>
-
-    <div class="controls">
-      <button id="startBtn" class="btn btn-primary">Start Recording</button>
-      <button id="stopBtn" class="btn btn-ghost" disabled>Stop</button>
-      <button id="pasteBtn" class="btn btn-ghost">Paste Transcript</button>
-      <button id="uploadBtn" class="btn btn-primary" style="background:#4338ca">Upload transcript</button>
-      <label style="display:inline-flex;align-items:center" class="hint">
-        <input id="uploadAudioFile" type="file" accept="audio/*" style="display:none"/>
-        <button id="selectAudioBtn" class="btn btn-ghost">Upload audio file</button>
-      </label>
-    </div>
-
-    <div id="status" class="status"></div>
-
-    <h3 style="margin-top:18px;">Transcript (editable)</h3>
-    <textarea id="transcript" placeholder="Transcript will appear here after recording or paste it here..."></textarea>
-
-    <div style="display:flex;gap:12px;align-items:center;margin-top:10px;">
-      <div class="meta">Uploaded transcript will be summarized into a short MoM and action items. The server keeps summaries in <code>/mom/</code>.</div>
-    </div>
-
-    <div style="margin-top:14px" class="meta">
-      <div id="resultBox"></div>
-    </div>
-
   </div>
 
 <script>
-  // helper: read query params
-  function qp(name) {
-    const params = new URLSearchParams(window.location.search);
-    return params.get(name);
-  }
-
-  // populate meeting + owner from query
-  const meetingEl = document.getElementById('meetingUrl');
-  const partEl = document.getElementById('participantEmail');
-  const meetingQS = qp('meeting');
-  const ownerQS = qp('owner');
-  if (meetingQS) {
-    try {
-      // if encoded, decode
-      meetingEl.textContent = decodeURIComponent(meetingQS);
-      meetingEl.dataset.raw = decodeURIComponent(meetingQS);
-    } catch(e) {
-      meetingEl.textContent = meetingQS;
-      meetingEl.dataset.raw = meetingQS;
-    }
-  }
-  if (ownerQS) {
-    try { partEl.value = decodeURIComponent(ownerQS); } catch(e){ partEl.value = ownerQS; }
-  }
-
-  // UI elements
-  const startBtn = document.getElementById('startBtn');
-  const stopBtn = document.getElementById('stopBtn');
-  const pasteBtn = document.getElementById('pasteBtn');
-  const uploadBtn = document.getElementById('uploadBtn');
-  const transcriptEl = document.getElementById('transcript');
+/* Recorder + Transcription Script
+   - Auto-attempts start on load
+   - Uses audio constraints with echoCancellation/noiseSuppression/autoGainControl
+   - Single MediaRecorder instance and single Web Speech Recognition
+   - Simple dedupe logic to avoid repeated phrases
+*/
+(async function(){
   const statusEl = document.getElementById('status');
-  const resultBox = document.getElementById('resultBox');
-  const selectAudioBtn = document.getElementById('selectAudioBtn');
-  const uploadAudioFile = document.getElementById('uploadAudioFile');
+  const startBtn = document.getElementById('btnStart');
+  const stopBtn = document.getElementById('btnStop');
+  const wave = document.getElementById('wave');
+  const transcriptEl = document.getElementById('transcript');
+  const uploadBtn = document.getElementById('uploadBtn');
 
-  // recording + media
-  let mediaRecorder = null;
+  let mediaStream = null;
+  let recorder = null;
   let recordedChunks = [];
   let recognition = null;
-  let usingSpeechAPI = false;
+  let liveTranscript = "";
+  let lastRecognized = ""; // for dedupe
+  const APP_BASE = (window.APP_BASE_URL || '').replace(/\/$/,'') || location.origin;
 
-  // Web Speech API live transcription (best-effort)
-  function startSpeechRecognition() {
-    if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) return false;
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    recognition = new SR();
-    recognition.lang = 'en-US';
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.onresult = (ev) => {
-      let final = '';
-      let interim = '';
-      for (let i = ev.resultIndex; i < ev.results.length; i++){
-        const r = ev.results[i];
-        if (r.isFinal) final += r[0].transcript + ' ';
-        else interim += r[0].transcript + ' ';
-      }
-      transcriptEl.value = (transcriptEl.value + ' ' + final + ' ' + interim).trim();
+  // audio constraints optimized for meetings
+  const constraints = {
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      channelCount: 1,
+      sampleRate: 44100
+    }
+  };
+
+  function updateStatus(t){
+    statusEl.textContent = t;
+  }
+
+  function showWave(msg){
+    wave.textContent = msg;
+  }
+
+  function appendTranscript(t){
+    if(!t) return;
+    // simple dedupe: ignore if very similar to last recognized chunk
+    const cleaned = t.trim();
+    if(!cleaned) return;
+    const normalized = cleaned.toLowerCase().replace(/\s+/g,' ');
+    if(normalized === lastRecognized) return;
+    // avoid repeating short filler repeats (e.g., "okay okay")
+    const deduped = dedupeRepeatedWords(normalized);
+    lastRecognized = deduped;
+    if(transcriptEl.textContent === "No transcript yet.") transcriptEl.textContent = deduped;
+    else transcriptEl.textContent += "\n\n" + deduped;
+    // store for upload
+    liveTranscript += (liveTranscript ? "\n" : "") + deduped;
+  }
+
+  // remove immediate repeated tokens like "hello hello" or "this is is"
+  function dedupeRepeatedWords(s){
+    return s.split(' ').filter((w,i,arr) => !(i>0 && arr[i-1]===w)).join(' ');
+  }
+
+  // Start mic + media recorder
+  async function startRecording(){
+    updateStatus('Requesting microphone...');
+    try{
+      mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+    }catch(err){
+      updateStatus('Microphone permission required.');
+      showWave('Click "Start Recording" to give mic permission.');
+      throw err;
+    }
+
+    // ensure only one recorder instance
+    if(recorder){ recorder.stop(); recorder = null; }
+
+    recordedChunks = [];
+    recorder = new MediaRecorder(mediaStream, { mimeType: 'audio/webm;codecs=opus' });
+    recorder.ondataavailable = e => {
+      if(e.data && e.data.size > 0) recordedChunks.push(e.data);
     };
-    recognition.onerror = (e) => {
-      console.warn('Speech recognition error', e);
+    recorder.onstart = () => {
+      updateStatus('Recording');
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      showWave('Recording… (audio is being captured)');
     };
+    recorder.onstop = () => {
+      updateStatus('Stopped');
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      showWave('Recording stopped. Ready to upload.');
+      uploadBtn.disabled = false;
+    };
+
+    recorder.start(1000); // collect chunks every 1s
+    startSpeechRecognition();
+  }
+
+  function stopRecording(){
+    if(recorder && recorder.state !== 'inactive') recorder.stop();
+    if(mediaStream){
+      mediaStream.getTracks().forEach(t => t.stop());
+      mediaStream = null;
+    }
+    stopSpeechRecognition();
+  }
+
+  // Web Speech API recognition with single instance
+  function startSpeechRecognition(){
+    // Web Speech API guard
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if(!SpeechRecognition) {
+      appendTranscript("[Browser does not support Web Speech API — transcripts will be uploaded for server-side transcription]");
+      return;
+    }
+
+    if(recognition) { /* already running */ return; }
+
+    recognition = new SpeechRecognition();
+    recognition.interimResults = false; // final results only (avoid duplicate interim)
+    recognition.continuous = true;      // continuous listening
+    recognition.lang = 'en-US';         // change if needed
+
+    recognition.onstart = () => { console.log('Speech recognition started'); }
+    recognition.onerror = (ev) => { console.warn('Speech recognition error', ev); }
     recognition.onend = () => {
-      // auto-restart if we are still recording
-      if (mediaRecorder && mediaRecorder.state === 'recording') {
-        try { recognition.start(); } catch(e){ }
+      // if recording is still active, restart recognition (handles bugs)
+      if(recorder && recorder.state === 'recording') {
+        try { recognition.start(); } catch(e){ console.warn('restart recognition failed',e); }
       }
     };
-    recognition.start();
-    usingSpeechAPI = true;
-    return true;
-  }
 
-  async function startRecording() {
-    statusEl.textContent = 'Requesting microphone permission...';
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      recordedChunks = [];
-      mediaRecorder = new MediaRecorder(stream);
-      mediaRecorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) recordedChunks.push(e.data);
-      };
-      mediaRecorder.onstart = () => {
-        statusEl.textContent = 'Recording...';
-        startBtn.disabled = true;
-        stopBtn.disabled = false;
-      };
-      mediaRecorder.onstop = () => {
-        statusEl.textContent = 'Recording stopped. You can upload the audio or paste/trim transcript.';
-        startBtn.disabled = false;
-        stopBtn.disabled = true;
-      };
-      mediaRecorder.start();
-      // try Web Speech API
-      startSpeechRecognition();
-    } catch (err) {
-      console.error(err);
-      statusEl.innerHTML = '<span class="warn">Microphone access denied or not available.</span>';
+    recognition.onresult = (evt) => {
+      // accumulate final results
+      for(let i=evt.resultIndex; i<evt.results.length; ++i){
+        if(evt.results[i].isFinal){
+          const text = evt.results[i][0].transcript;
+          appendTranscript(text);
+        }
+      }
+    };
+
+    try{
+      recognition.start();
+    }catch(e){
+      console.warn('Recognition start failed', e);
     }
   }
 
-  function stopRecording() {
-    if (recognition) {
-      try { recognition.stop(); } catch(e){}
+  function stopSpeechRecognition(){
+    if(recognition){
+      try { recognition.onend = null; recognition.stop(); } catch(e){}
       recognition = null;
-      usingSpeechAPI = false;
-    }
-    if (mediaRecorder && mediaRecorder.state === 'recording') {
-      mediaRecorder.stop();
     }
   }
 
-  startBtn.addEventListener('click', startRecording);
-  stopBtn.addEventListener('click', stopRecording);
+  // Upload endpoint: adapt to your backend path
+  async function uploadRecording(){
+    if(recordedChunks.length === 0){
+      alert('No audio recorded yet.');
+      return;
+    }
+    updateStatus('Uploading audio & transcript...');
+    const blob = new Blob(recordedChunks, { type: 'audio/webm' });
+    const form = new FormData();
+    form.append('file', blob, 'meeting_recording.webm');
+    form.append('transcript', liveTranscript);
 
-  pasteBtn.addEventListener('click', async () => {
+    try{
+      // uses your existing upload endpoint; adapt path if different
+      const resp = await fetch(APP_BASE + '/upload-audio', {
+        method: 'POST',
+        body: form
+      });
+      if(!resp.ok) throw new Error(await resp.text());
+      updateStatus('Upload complete');
+      alert('Upload successful.');
+    }catch(err){
+      updateStatus('Upload failed: ' + (err.message||err));
+      console.error(err);
+      alert('Upload failed: ' + (err.message||err));
+    }
+  }
+
+  // Auto-start attempt on page load
+  async function autoStart(){
+    // some browsers require user gesture; we still attempt
+    try{
+      await startRecording();
+    }catch(e){
+      console.log('Auto-start blocked:', e);
+      updateStatus('Click Start Recording to enable mic'); // user visible
+      showWave('Auto-start blocked by browser — please click Start.');
+      startBtn.disabled = false;
+    }
+  }
+
+  // Hook up UI
+  startBtn.addEventListener('click', async (e) => {
+    startBtn.disabled = true;
     try {
-      const text = await navigator.clipboard.readText();
-      transcriptEl.value = (transcriptEl.value + '\n' + text).trim();
-      statusEl.textContent = 'Pasted from clipboard';
-    } catch (e) {
-      statusEl.textContent = 'Could not read clipboard — paste manually.';
+      await startRecording();
+    } catch(err) {
+      startBtn.disabled = false;
+      console.error(err);
     }
   });
 
-  selectAudioBtn.addEventListener('click', ()=> uploadAudioFile.click());
-
-  uploadAudioFile.addEventListener('change', async (ev) => {
-    const f = ev.target.files[0];
-    if (!f) return;
-    const meeting = meetingEl.dataset.raw || meetingQS;
-    if (!meeting) { statusEl.textContent = 'Meeting query param missing'; return; }
-    const participant = (partEl.value || '').trim();
-    const fd = new FormData();
-    fd.append('meeting', meeting);
-    fd.append('owner', ownerQS || '');
-    fd.append('participant_email', participant);
-    fd.append('audio', f, f.name);
-    statusEl.textContent = 'Uploading audio...';
-    try {
-      const r = await fetch('/upload-recording', { method:'POST', body: fd });
-      const j = await r.json();
-      if (j.status === 'ok') {
-        statusEl.innerHTML = '<span class="ok">Audio uploaded</span>';
-        if (j.mom_link) resultBox.innerHTML = `Generated MoM link: <a href="${j.mom_link}" target="_blank">${j.mom_link}</a>`;
-      } else {
-        statusEl.textContent = 'Upload error: ' + (j.error || JSON.stringify(j));
-      }
-    } catch (e) {
-      statusEl.textContent = 'Upload failed: ' + e.message;
-    }
+  stopBtn.addEventListener('click', (e) => {
+    stopRecording();
   });
 
-  uploadBtn.addEventListener('click', async () => {
-    const meeting = meetingEl.dataset.raw || meetingQS;
-    if (!meeting) { statusEl.textContent = 'Meeting query param missing. Provide meeting in URL as ?meeting=...'; return; }
-    const transcript = transcriptEl.value.trim();
-    if (!transcript) { statusEl.textContent = 'Transcript is empty. Paste or record first.'; return; }
-    const participant = (partEl.value || '').trim();
-    statusEl.textContent = 'Uploading transcript...';
-    try {
-      const payload = {
-        meeting: meeting,
-        owner: ownerQS || '',
-        participant_email: participant || '',
-        transcript: transcript,
-        final: true
-      };
-      const r = await fetch('/upload-recording', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
-      const j = await r.json();
-      if (j.status === 'ok') {
-        statusEl.innerHTML = '<span class="ok">Transcript uploaded & MoM generated.</span>';
-        if (j.mom_link) resultBox.innerHTML = `Generated MoM link: <a href="${j.mom_link}" target="_blank">${j.mom_link}</a>`;
-      } else {
-        statusEl.textContent = 'Upload error: ' + (j.error || JSON.stringify(j));
-      }
-    } catch (e) {
-      statusEl.textContent = 'Upload failed: ' + e.message;
-    }
+  uploadBtn.addEventListener('click', (e) => {
+    uploadRecording();
   });
 
-  // enable/disable stop/start depending on recorder state initialization
-  stopBtn.disabled = true;
+  // Try auto-start
+  // Wait a tick so Teams/iframe has a chance to focus
+  setTimeout(autoStart, 700);
+
+})();
 </script>
 </body>
 </html>
