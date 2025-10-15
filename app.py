@@ -521,106 +521,141 @@ import re
 import nltk
 from collections import defaultdict
 
-# --- Ensure punkt tokenizer is available safely ---
+# Ensure punkt exists (safe / quiet)
 try:
     nltk.data.find("tokenizers/punkt")
 except LookupError:
     try:
         nltk.download("punkt", quiet=True)
-    except Exception as e:
-        print("⚠️ Could not download punkt automatically:", e)
+    except Exception:
+        pass
 
 def _split_sentences(text: str):
-    """
-    Robust sentence splitter using NLTK if available; regex fallback otherwise.
-    Always returns a list of clean sentences.
-    """
     if not text or not text.strip():
         return []
-
-    text = text.strip().replace("\n", " ")
-    text = re.sub(r"\s+", " ", text)
-
-    # Try NLTK first
+    txt = re.sub(r"\s+", " ", text.replace("\n", " ")).strip()
     try:
-        sentences = nltk.sent_tokenize(text)
-        return [s.strip() for s in sentences if s.strip()]
-    except Exception as e:
-        print("⚠️ NLTK failed, using regex fallback:", e)
+        sents = nltk.sent_tokenize(txt)
+        return [s.strip() for s in sents if s.strip()]
+    except Exception:
+        # simple safe fallback
+        parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", txt)
+        return [p.strip() for p in parts if p.strip()]
 
-    # Fallback regex (safe fixed-width lookbehind/lookahead)
-    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", text)
-    return [p.strip() for p in parts if p.strip()]
+def _extract_person_action(sentence: str):
+    """
+    Try to extract (person, short_action) from a sentence.
+    Returns (person (or None), action_text).
+    """
+    s = sentence.strip()
+    # normalize punctuation spaces
+    s_norm = re.sub(r'\s+', ' ', s)
 
+    # Patterns that explicitly name a person followed by a task:
+    # e.g. "Asha your task is to clean the data"
+    m = re.search(r"\b([A-Z][a-z]{1,24})\b[,:\s]{1,20}(?:your task is|your task|you will|you'll|you are|please|please\s+)?\s*(.*)", s_norm, re.I)
+    if m and m.group(2).strip():
+        person = m.group(1)
+        action = m.group(2).strip()
+        # trim trailing clauses that are too long: keep first clause
+        action = re.split(r"(?:\band\b|\bthen\b|[;:])", action, maxsplit=1)[0].strip()
+        return person, action
+
+    # Patterns "John will do X", "Mark will be doing X", etc.
+    m2 = re.search(r"\b([A-Z][a-z]{1,24})\b.*?\b(will|shall|is going to|is to|will be|should|must|needs to|need to)\b\s*(.*)", s_norm, re.I)
+    if m2 and m2.group(3).strip():
+        person = m2.group(1)
+        action = m2.group(3).strip()
+        action = re.split(r"(?:\band\b|\bthen\b|[;:])", action, maxsplit=1)[0].strip()
+        return person, action
+
+    # Imperatives that may include a direct object: "Please prepare the report by Friday"
+    m3 = re.search(r"^(?:please\s+)?\b(assign|prepare|send|submit|create|make|share|prepare|compile|deliver|complete|finish|report|present|analyse|analyze|clean|model|process)\b\s+(.*)", s_norm, re.I)
+    if m3:
+        person = None
+        action = (m3.group(1) + " " + m3.group(2)).strip()
+        action = re.split(r"(?:\band\b|\bthen\b|[;:])", action, maxsplit=1)[0].strip()
+        return person, action
+
+    # Patterns like "Your task is to ...", no name
+    m4 = re.search(r"(?:your task is to|your task is|you will need to|you need to|you are to)\s+(.*)", s_norm, re.I)
+    if m4:
+        action = m4.group(1).strip()
+        action = re.split(r"(?:\band\b|\bthen\b|[;:])", action, maxsplit=1)[0].strip()
+        return None, action
+
+    # Last-resort: look for "X will" anywhere without a good tail
+    m5 = re.search(r"\b([A-Z][a-z]{1,24})\b.*\b(will|should|must|needs to|need to)\b", s_norm, re.I)
+    if m5:
+        person = m5.group(1)
+        # return the whole sentence trimmed if no small phrase found
+        return person, s_norm
+
+    # no person/action match; return None person and whole sentence as a candidate if it contains action keywords
+    if re.search(r"\b(will|should|must|need to|need|task|assign|please|due|deadline|report|deliver|submit|prepare|complete|clean|model)\b", s_norm, re.I):
+        return None, s_norm
+
+    return None, None
 
 def summarize_transcript(transcript: str, max_sentences: int = 6):
     """
-    Generates a concise summary and extracts action items from transcript text.
-    Uses NLTK for sentence tokenization and heuristic keyword detection.
+    Returns: {"summary": str, "action_items": [str,...]}
+    Improved action extraction: shorter, person-aware items.
     """
     if not transcript or not transcript.strip():
         return {"summary": "(no transcript provided)", "action_items": []}
 
-    # Clean and normalize
-    clean = re.sub(r"\s+", " ", transcript.strip())
-
-    # Split sentences
+    clean = re.sub(r"\s+", " ", transcript.replace("\r", " ").strip())
     sentences = _split_sentences(clean)
     if not sentences:
         sentences = [clean]
 
-    # --- Extract action items ---
-    action_keywords = [
-        "will", "will be", "take care", "responsible", "should", "must",
-        "need to", "have to", "task", "action", "assign", "please",
-        "deliver", "submit", "due", "deadline", "report", "complete", "finish"
-    ]
-    action_lines = []
-    for s in sentences:
-        lower = s.lower()
-        if any(k in lower for k in action_keywords):
-            action_lines.append(s.strip())
-
-    # Deduplicate actions (order-preserving)
-    seen, actions = set(), []
-    for a in action_lines:
-        norm = re.sub(r"\s+", " ", a)
-        if norm not in seen:
-            seen.add(norm)
-            actions.append(norm)
-
-    # --- Assign actions to people ---
-    person_tasks = defaultdict(list)
-    for a in actions:
-        # Try to detect a name (capitalized word before "will", "task", etc.)
-        m = re.search(r"\b([A-Z][a-z]{1,24})\b(?:[,:\s]+(?:will|should|must|task|please|responsible))", a)
-        if m:
-            person_tasks[m.group(1)].append(a)
-        else:
-            person_tasks["General"].append(a)
-
-    # --- Select summary sentences ---
-    summary_triggers = [
-        "discuss", "meeting", "project", "goal", "topic", "decide", "plan",
-        "overview", "agenda", "update", "progress"
-    ]
-    important = [s for s in sentences if any(t in s.lower() for t in summary_triggers)]
+    # Build a short summary (prefer sentences containing meeting/project triggers)
+    triggers = ["discuss", "meeting", "project", "goal", "topic", "update", "overview", "decide", "plan"]
+    important = [s for s in sentences if any(t in s.lower() for t in triggers)]
     if not important:
         important = sentences[:max_sentences]
-
     summary = " ".join(important[:max_sentences]).strip()
 
-    # --- Format readable action list ---
-    action_items = []
-    for person, lines in person_tasks.items():
-        for l in lines:
-            clean_line = re.sub(r"\s+", " ", l).strip()
-            action_items.append(f"{person}: {clean_line}")
+    # Extract actions more carefully
+    person_tasks = defaultdict(list)
+    general_actions = []
+    for s in sentences:
+        person, action = _extract_person_action(s)
+        if action:
+            # sanitize action string
+            action_clean = re.sub(r'\s+', ' ', action).strip().rstrip('.,;:')
+            if person:
+                person_tasks[person].append(action_clean)
+            else:
+                general_actions.append(action_clean)
 
-    return {
-        "summary": summary or "(no summary extracted)",
-        "action_items": action_items or ["(no explicit action items detected)"]
-    }
+    # If we found nothing using the patterns, fallback to scanning for lines with action keywords
+    if not any(person_tasks.values()) and not general_actions:
+        for s in sentences:
+            if re.search(r"\b(will|should|must|need to|task|assign|please|due|deadline|report|deliver|submit|prepare|complete|clean|model)\b", s, re.I):
+                # prefer short first clause
+                short = re.split(r"(?:[;:]|\band\b|\bthen\b)", s, maxsplit=1)[0].strip()
+                general_actions.append(short)
+
+    # Format action items
+    action_items = []
+    for person, tasks in person_tasks.items():
+        # dedupe
+        seen = set()
+        for t in tasks:
+            if t not in seen:
+                seen.add(t)
+                action_items.append(f"{person}: {t}")
+    # append general actions
+    for ga in dict.fromkeys(general_actions).keys():
+        action_items.append(f"General: {ga}")
+
+    if not action_items:
+        action_items = ["(no explicit action items detected)"]
+
+    return {"summary": summary or "(no summary extracted)", "action_items": action_items}
+
 
 # ---------- FastAPI ----------
 from fastapi.middleware.cors import CORSMiddleware
