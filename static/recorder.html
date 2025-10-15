@@ -26,9 +26,11 @@
     .btn-primary { background:var(--accent); color:white; }
     .btn-ghost { background:transparent; color:var(--accent); border:1px solid rgba(111,70,246,0.12); }
     .status { color:var(--muted); font-size:13px; }
-    .wave { width:100%; height:86px; background:linear-gradient(180deg,#f8fafc,#fff); border-radius:10px; border:1px dashed #e6e9ef; display:flex; align-items:center; justify-content:center; color:#9aa3b2; margin-bottom:18px; }
-    .transcript { max-height:260px; overflow:auto; padding:12px; background:#fafbff; border-radius:10px; border:1px solid #eef2ff; color:#111; font-size:14px; line-height:1.45; }
+    .wave { width:100%; height:86px; background:linear-gradient(180deg,#f8fafc,#fff); border-radius:10px; border:1px dashed #e6e9ef; display:flex; align-items:center; justify-content:center; color:#9aa3b2; margin-bottom:18px; padding:8px; text-align:center; }
+    .transcript { max-height:260px; overflow:auto; padding:12px; background:#fafbff; border-radius:10px; border:1px solid #eef2ff; color:#111; font-size:14px; line-height:1.45; white-space:pre-wrap; }
     .muted { color:var(--muted); font-size:13px; }
+    .small { font-size:12px; color:#7b7f86; }
+    a.momlink { display:inline-block; margin-top:10px; color:var(--accent); text-decoration:none; font-weight:600; }
   </style>
 </head>
 <body>
@@ -45,6 +47,7 @@
       <div class="controls">
         <button id="btnStart" class="btn-primary">Start Recording</button>
         <button id="btnStop" class="btn-ghost" disabled>Stop</button>
+        <div style="flex:1"></div>
         <div class="status" id="status">Idle</div>
       </div>
 
@@ -57,6 +60,7 @@
       <div class="muted">Upload / Save</div>
       <div style="margin-top:10px;">
         <button id="uploadBtn" class="btn-ghost" disabled>Upload Audio & Transcript</button>
+        <div id="uploadResult" class="small" style="margin-top:8px;"></div>
       </div>
     </div>
   </div>
@@ -65,8 +69,9 @@
 /* Recorder + Transcription Script
    - Auto-attempts start on load
    - Uses audio constraints with echoCancellation/noiseSuppression/autoGainControl
-   - Single MediaRecorder instance and single Web Speech Recognition
-   - Simple dedupe logic to avoid repeated phrases
+   - Single MediaRecorder instance and Web Speech Recognition
+   - Dedupe logic to avoid repeated phrases
+   - Posts form to /upload-recording with fields: audio, transcript, meeting, owner, participant_email
 */
 (async function(){
   const statusEl = document.getElementById('status');
@@ -75,6 +80,7 @@
   const wave = document.getElementById('wave');
   const transcriptEl = document.getElementById('transcript');
   const uploadBtn = document.getElementById('uploadBtn');
+  const uploadResult = document.getElementById('uploadResult');
 
   let mediaStream = null;
   let recorder = null;
@@ -83,6 +89,12 @@
   let liveTranscript = "";
   let lastRecognized = ""; // for dedupe
   const APP_BASE = (window.APP_BASE_URL || '').replace(/\/$/,'') || location.origin;
+
+  // Parse URL params for meeting/owner/participant
+  const urlParams = new URLSearchParams(window.location.search);
+  const meetingParam = urlParams.get('meeting') || urlParams.get('q') || '';
+  const ownerParam = urlParams.get('owner') || '';
+  const participantParam = urlParams.get('participant') || ownerParam || '';
 
   // audio constraints optimized for meetings
   const constraints = {
@@ -105,12 +117,11 @@
 
   function appendTranscript(t){
     if(!t) return;
-    // simple dedupe: ignore if very similar to last recognized chunk
     const cleaned = t.trim();
     if(!cleaned) return;
     const normalized = cleaned.toLowerCase().replace(/\s+/g,' ');
+    // simple dedupe
     if(normalized === lastRecognized) return;
-    // avoid repeating short filler repeats (e.g., "okay okay")
     const deduped = dedupeRepeatedWords(normalized);
     lastRecognized = deduped;
     if(transcriptEl.textContent === "No transcript yet.") transcriptEl.textContent = deduped;
@@ -119,7 +130,6 @@
     liveTranscript += (liveTranscript ? "\n" : "") + deduped;
   }
 
-  // remove immediate repeated tokens like "hello hello" or "this is is"
   function dedupeRepeatedWords(s){
     return s.split(' ').filter((w,i,arr) => !(i>0 && arr[i-1]===w)).join(' ');
   }
@@ -135,7 +145,6 @@
       throw err;
     }
 
-    // ensure only one recorder instance
     if(recorder){ recorder.stop(); recorder = null; }
 
     recordedChunks = [];
@@ -147,6 +156,7 @@
       updateStatus('Recording');
       startBtn.disabled = true;
       stopBtn.disabled = false;
+      uploadBtn.disabled = true;
       showWave('Recording… (audio is being captured)');
     };
     recorder.onstop = () => {
@@ -172,31 +182,27 @@
 
   // Web Speech API recognition with single instance
   function startSpeechRecognition(){
-    // Web Speech API guard
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if(!SpeechRecognition) {
       appendTranscript("[Browser does not support Web Speech API — transcripts will be uploaded for server-side transcription]");
       return;
     }
-
-    if(recognition) { /* already running */ return; }
+    if(recognition) { return; }
 
     recognition = new SpeechRecognition();
-    recognition.interimResults = false; // final results only (avoid duplicate interim)
-    recognition.continuous = true;      // continuous listening
-    recognition.lang = 'en-US';         // change if needed
+    recognition.interimResults = false;
+    recognition.continuous = true;
+    recognition.lang = 'en-US';
 
     recognition.onstart = () => { console.log('Speech recognition started'); }
     recognition.onerror = (ev) => { console.warn('Speech recognition error', ev); }
     recognition.onend = () => {
-      // if recording is still active, restart recognition (handles bugs)
       if(recorder && recorder.state === 'recording') {
         try { recognition.start(); } catch(e){ console.warn('restart recognition failed',e); }
       }
     };
 
     recognition.onresult = (evt) => {
-      // accumulate final results
       for(let i=evt.resultIndex; i<evt.results.length; ++i){
         if(evt.results[i].isFinal){
           const text = evt.results[i][0].transcript;
@@ -219,42 +225,80 @@
     }
   }
 
-  // Upload endpoint: adapt to your backend path
+  // Upload endpoint: matches backend /upload-recording
   async function uploadRecording(){
-    if(recordedChunks.length === 0){
-      alert('No audio recorded yet.');
+    if(recordedChunks.length === 0 && !liveTranscript){
+      alert('No audio or transcript to upload.');
       return;
     }
+
     updateStatus('Uploading audio & transcript...');
-    const blob = new Blob(recordedChunks, { type: 'audio/webm' });
+    uploadResult.textContent = '';
+
+    const blob = recordedChunks.length ? new Blob(recordedChunks, { type: 'audio/webm' }) : null;
     const form = new FormData();
-    form.append('file', blob, 'meeting_recording.webm');
-    form.append('transcript', liveTranscript);
+
+    if(blob) form.append('audio', blob, 'meeting_recording.webm');   // backend expects 'audio'
+    form.append('transcript', liveTranscript || '');
+    // include meeting/owner/participant if present
+    if(meetingParam) form.append('meeting', meetingParam);
+    if(ownerParam) form.append('owner', ownerParam);
+    if(participantParam) form.append('participant_email', participantParam);
 
     try{
-      // uses your existing upload endpoint; adapt path if different
-      const resp = await fetch(APP_BASE + '/upload-audio', {
+      const url = APP_BASE + '/upload-recording';
+      console.log('Uploading to', url, 'with meeting=', meetingParam, 'owner=', ownerParam);
+      const resp = await fetch(url, {
         method: 'POST',
         body: form
       });
-      if(!resp.ok) throw new Error(await resp.text());
+
+      const contentType = resp.headers.get('content-type') || '';
+      let data = null;
+      if(contentType.includes('application/json')){
+        data = await resp.json();
+      } else {
+        // fallback to text
+        data = { detail: await resp.text() };
+      }
+
+      if(!resp.ok){
+        const msg = (data && (data.detail || data.error || JSON.stringify(data))) || ('HTTP ' + resp.status);
+        updateStatus('Upload failed');
+        uploadResult.textContent = 'Upload failed: ' + msg;
+        console.error('Upload failed', resp.status, data);
+        alert('Upload failed: ' + msg);
+        return;
+      }
+
       updateStatus('Upload complete');
-      alert('Upload successful.');
+      uploadResult.textContent = 'Upload complete.';
+      console.log('Upload success', data);
+
+      // If moment-of-meeting link returned, open it
+      if(data && data.mom_link){
+        const link = data.mom_link;
+        uploadResult.innerHTML = 'MoM: <a class="momlink" target="_blank" rel="noopener" href="' + link + '">' + link + '</a>';
+        // open in a new tab automatically
+        window.open(link, '_blank');
+      } else {
+        alert('Upload successful.');
+      }
     }catch(err){
       updateStatus('Upload failed: ' + (err.message||err));
-      console.error(err);
+      console.error('Upload error', err);
+      uploadResult.textContent = 'Upload error: ' + (err.message||err);
       alert('Upload failed: ' + (err.message||err));
     }
   }
 
   // Auto-start attempt on page load
   async function autoStart(){
-    // some browsers require user gesture; we still attempt
     try{
       await startRecording();
     }catch(e){
       console.log('Auto-start blocked:', e);
-      updateStatus('Click Start Recording to enable mic'); // user visible
+      updateStatus('Click Start Recording to enable mic');
       showWave('Auto-start blocked by browser — please click Start.');
       startBtn.disabled = false;
     }
@@ -279,8 +323,7 @@
     uploadRecording();
   });
 
-  // Try auto-start
-  // Wait a tick so Teams/iframe has a chance to focus
+  // Try auto-start after small delay
   setTimeout(autoStart, 700);
 
 })();
