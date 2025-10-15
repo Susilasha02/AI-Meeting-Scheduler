@@ -7,7 +7,7 @@ import uuid
 import zoneinfo
 import urllib.parse
 import logging
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -328,6 +328,7 @@ def _apply_time_preferences(dt_date: datetime, prompt: str, local_tz: zoneinfo.Z
     # default
     return dt_date.replace(hour=9, minute=0, second=0, microsecond=0, tzinfo=local_tz)
 
+# ---- parse_prompt_to_window (unchanged from your last version) ----
 def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_duration_min: int = 45):
     """
     Main parser. Returns a dict with keys:
@@ -546,7 +547,6 @@ def parse_prompt(prompt: str, contacts_map: Dict[str, str] = None) -> Dict:
             "window_start": rfc3339((now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)),
             "window_end": rfc3339((now + timedelta(days=5)).replace(hour=18, minute=30, second=0, microsecond=0)),
         }
-
 
 # ---------- summarizer for MoM (improved with optional spaCy) ----------
 import re
@@ -828,7 +828,93 @@ def nlp_suggest(body: dict = Body(...)):
         logger.error("Exception in /nlp/suggest: %s\n%s", str(e), traceback.format_exc())
         return JSONResponse({"error": "server_error", "detail": str(e), "trace": traceback.format_exc()}, status_code=500)
 
-# Core suggest
+# ---------- New helper: generate_suggestions (evening-aware) ----------
+def generate_suggestions(
+    events: List[Tuple[datetime, datetime]],
+    duration_min: int,
+    buffer_min: int,
+    window_start: datetime,
+    window_end: datetime,
+    tzinfo: zoneinfo.ZoneInfo,
+    prompt_text: Optional[str] = None,
+    max_results: int = 10
+):
+    """
+    events: list of (start_dt, end_dt) datetimes in tzinfo timezone (or timezone-aware)
+    duration_min, buffer_min: ints
+    window_start, window_end: timezone-aware datetimes (in tzinfo)
+    prompt_text: original user prompt (used to detect 'tonight' / pm preferences)
+    Returns list of dicts: [{"start": dt_start, "end": dt_end}, ...] (datetimes in tzinfo)
+    """
+    # Normalize window to tzinfo
+    if window_start.tzinfo is None:
+        start_local = window_start.replace(tzinfo=tzinfo)
+    else:
+        start_local = window_start.astimezone(tzinfo)
+    if window_end.tzinfo is None:
+        end_local = window_end.replace(tzinfo=tzinfo)
+    else:
+        end_local = window_end.astimezone(tzinfo)
+
+    # Normalize event list into sorted tuples in tzinfo
+    normalized_busy = []
+    for s, e in events:
+        if s.tzinfo is None:
+            s = s.replace(tzinfo=zoneinfo.ZoneInfo("UTC")).astimezone(tzinfo)
+        else:
+            s = s.astimezone(tzinfo)
+        if e.tzinfo is None:
+            e = e.replace(tzinfo=zoneinfo.ZoneInfo("UTC")).astimezone(tzinfo)
+        else:
+            e = e.astimezone(tzinfo)
+        normalized_busy.append((s, e))
+    normalized_busy.sort(key=lambda x: x[0])
+
+    # Detect evening/night preference from prompt
+    prefers_evening = False
+    if prompt_text:
+        pl = prompt_text.lower()
+        if any(tok in pl for tok in ["tonight", "evening", "night", "late", "pm", "9pm", "10pm", "11pm"]):
+            prefers_evening = True
+
+    # Expand allowed daily hours if evening requested
+    if prefers_evening:
+        day_start_hour = 6
+        day_end_hour = 23
+    else:
+        day_start_hour = 6
+        day_end_hour = 18
+
+    # Start scanning slots from the window start (rounded)
+    slot_cursor = start_local.replace(second=0, microsecond=0)
+    if slot_cursor.hour < day_start_hour:
+        slot_cursor = slot_cursor.replace(hour=day_start_hour, minute=0)
+
+    candidate_slots = []
+    iterations = 0
+    max_iterations = 2000
+
+    while slot_cursor + timedelta(minutes=duration_min) <= end_local and len(candidate_slots) < max_results and iterations < max_iterations:
+        iterations += 1
+        slot_end = slot_cursor + timedelta(minutes=duration_min)
+
+        # Check daily hour bounds for the slot
+        if (slot_cursor.hour >= day_start_hour) and (slot_end.hour <= day_end_hour or (slot_end.hour == day_end_hour and slot_end.minute == 0)):
+            # Check overlap with busy events
+            overlap = False
+            for bstart, bend in normalized_busy:
+                if slot_end <= bstart or slot_cursor >= bend:
+                    continue
+                overlap = True
+                break
+            if not overlap:
+                candidate_slots.append({"start": slot_cursor, "end": slot_end})
+
+        slot_cursor = slot_cursor + timedelta(minutes=buffer_min)
+
+    return candidate_slots
+
+# Core suggest (replaced internals to use generate_suggestions)
 @app.post("/suggest")
 def suggest(body: dict = Body(default={})):
     """
@@ -858,6 +944,7 @@ def suggest(body: dict = Body(default={})):
         prompt_text = body.get("prompt", "")
         today_only_flag = bool(body.get("today_only", False))
 
+        # Compute start/end as datetimes (may be naive or tz-aware)
         if start_iso and end_iso:
             start = dparse.isoparse(start_iso)
             end   = dparse.isoparse(end_iso)
@@ -868,6 +955,8 @@ def suggest(body: dict = Body(default={})):
                     start_dt, end_dt = get_search_window_from_prompt(prompt_text, days_ahead=0)
                 else:
                     start_dt, end_dt = get_search_window_from_prompt(prompt_text, days_ahead=7)
+                # get_search_window_from_prompt returns tz-aware LOCAL_TZ datetimes
+                # Convert to UTC naive for the freebusy call (maintain original behaviour)
                 start = start_dt.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
                 end = end_dt.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
             else:
@@ -875,12 +964,72 @@ def suggest(body: dict = Body(default={})):
                 start = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
                 end   = (now + timedelta(days=5)).replace(hour=18, minute=30, second=0, microsecond=0)
 
-        # call freebusy
-        fb = freebusy(creds, attendees, rfc3339(start), rfc3339(end))
+        # Determine LOCAL_TZ zoneinfo
+        try:
+            local_tz = zoneinfo.ZoneInfo(LOCAL_TZ)
+        except Exception:
+            local_tz = zoneinfo.ZoneInfo("UTC")
 
-        busy_lists = [[{"start":b["start"], "end":b["end"]} for b in fb[cal]] for cal in fb]
-        free = compute_free(busy_lists, start, end)
-        cands = candidates(free, duration_min=duration_min, buffer_min=buffer_min)
+        # For freebusy we use RFC3339 UTC - preserve previous behaviour:
+        # If start is naive, we consider it already UTC (existing code did that).
+        if start.tzinfo is None:
+            start_utc_naive = start
+        else:
+            start_utc_naive = start.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
+        if end.tzinfo is None:
+            end_utc_naive = end
+        else:
+            end_utc_naive = end.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
+
+        # Also prepare tz-aware local windows for suggestion generation
+        start_local = start_utc_naive.replace(tzinfo=zoneinfo.ZoneInfo("UTC")).astimezone(local_tz)
+        end_local = end_utc_naive.replace(tzinfo=zoneinfo.ZoneInfo("UTC")).astimezone(local_tz)
+
+        # call freebusy (using UTC RFC3339 as before)
+        fb = freebusy(creds, attendees, rfc3339(start_utc_naive), rfc3339(end_utc_naive))
+
+        # Build busy_events list (convert each busy block into datetime tuples in local_tz)
+        busy_events: List[Tuple[datetime, datetime]] = []
+        for cal_id, blocks in fb.items():
+            for b in blocks:
+                try:
+                    s = dparse.isoparse(b["start"])
+                    e = dparse.isoparse(b["end"])
+                except Exception:
+                    continue
+                # normalize into local_tz for the slot generator
+                if s.tzinfo is None:
+                    s = s.replace(tzinfo=zoneinfo.ZoneInfo("UTC")).astimezone(local_tz)
+                else:
+                    s = s.astimezone(local_tz)
+                if e.tzinfo is None:
+                    e = e.replace(tzinfo=zoneinfo.ZoneInfo("UTC")).astimezone(local_tz)
+                else:
+                    e = e.astimezone(local_tz)
+                busy_events.append((s, e))
+
+        # Generate candidate slots using the new generator (returns tz-aware local datetimes)
+        candidate_slots = generate_suggestions(
+            busy_events,
+            duration_min,
+            buffer_min,
+            window_start=start_local,
+            window_end=end_local,
+            tzinfo=local_tz,
+            prompt_text=prompt_text,
+            max_results=10
+        )
+
+        # Convert candidate_slots into the same format your scoring expects (iso strings + meta)
+        cands = []
+        for s in candidate_slots:
+            sl_iso = s["start"].isoformat()
+            en_iso = s["end"].isoformat()
+            cands.append({
+                "start": sl_iso,
+                "end": en_iso,
+                "meta": {"buffers": {"pre": buffer_min, "post": buffer_min}}
+            })
 
         # fairness-aware scoring
         scored = []
@@ -1265,8 +1414,7 @@ async def upload_recording(request: Request):
         return JSONResponse({"error":"server_error","detail":str(e), "trace": traceback.format_exc()}, status_code=500)
 
 
-
-# ---------- MoM view (updated to show participants + transcripts) ----------
+# ---------- MoM view (unchanged) ----------
 @app.get("/mom/{mom_id}", response_class=HTMLResponse)
 def get_mom(mom_id: str):
     mom_file = MOMS / f"{mom_id}.json"
@@ -1359,4 +1507,3 @@ def get_mom(mom_id: str):
         participants_html = parts_html
     )
     return HTMLResponse(html)
-
