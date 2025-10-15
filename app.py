@@ -521,7 +521,7 @@ import re
 import nltk
 from collections import defaultdict
 
-# Ensure punkt exists (safe / quiet)
+# Ensure punkt exists (quiet)
 try:
     nltk.data.find("tokenizers/punkt")
 except LookupError:
@@ -529,6 +529,17 @@ except LookupError:
         nltk.download("punkt", quiet=True)
     except Exception:
         pass
+
+# Common filler/greeting tokens to ignore when they're the first token
+_GREETINGS = {"hello", "hi", "hey", "ok", "okay", "so", "alright", "right", "well", "today", "thanks", "thank"}
+
+# Action trigger verbs / phrases
+_ACTION_TRIGGERS = [
+    "will", "shall", "is going to", "is to", "will be", "should", "must",
+    "needs to", "need to", "need", "task", "assign", "please", "due", "deadline",
+    "report", "deliver", "submit", "prepare", "create", "make", "send", "complete",
+    "clean", "model", "process", "analyze", "analyse"
+]
 
 def _split_sentences(text: str):
     if not text or not text.strip():
@@ -538,69 +549,114 @@ def _split_sentences(text: str):
         sents = nltk.sent_tokenize(txt)
         return [s.strip() for s in sents if s.strip()]
     except Exception:
-        # simple safe fallback
-        parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", txt)
+        # fallback: split on punctuation followed by space + capital (safe)
+        parts = re.split(r'(?<=[.!?])\s+(?=[A-Z0-9])', txt)
         return [p.strip() for p in parts if p.strip()]
+
+def _likely_names(sentence: str):
+    """
+    Return list of candidate capitalized tokens that might be names,
+    excluding tokens that are obvious greetings or sentence-start fillers.
+    """
+    # find capitalized tokens of at least 2 letters
+    candidates = re.findall(r"\b([A-Z][a-z]{1,})\b", sentence)
+    # filter out tokens that are actually common words or all-uppercase acronyms
+    filtered = []
+    for i, token in enumerate(candidates):
+        low = token.lower()
+        if low in _GREETINGS:
+            continue
+        # ignore single-letter tokens and tokens that look like days/months if present
+        if len(token) < 2:
+            continue
+        filtered.append(token)
+    # return unique in order
+    seen = set()
+    out = []
+    for t in filtered:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+def _shorten_action(phrase: str):
+    """Trim action phrase at obvious clause boundaries to keep it concise."""
+    p = phrase.strip()
+    # cut at first ' and ' or ' then ' or ';' or ':' to avoid long paragraphs
+    parts = re.split(r"\b(?:and|then)\b|[;:]", p, maxsplit=1, flags=re.I)
+    return parts[0].strip().rstrip(".,;:")
 
 def _extract_person_action(sentence: str):
     """
-    Try to extract (person, short_action) from a sentence.
-    Returns (person (or None), action_text).
+    Attempt to parse (person, action) from a sentence.
+    Returns (person_name_or_None, short_action_or_None).
+    Uses several heuristics & patterns.
     """
     s = sentence.strip()
-    # normalize punctuation spaces
-    s_norm = re.sub(r'\s+', ' ', s)
+    if not s:
+        return None, None
 
-    # Patterns that explicitly name a person followed by a task:
-    # e.g. "Asha your task is to clean the data"
-    m = re.search(r"\b([A-Z][a-z]{1,24})\b[,:\s]{1,20}(?:your task is|your task|you will|you'll|you are|please|please\s+)?\s*(.*)", s_norm, re.I)
-    if m and m.group(2).strip():
+    # normalize spacing
+    s_norm = re.sub(r"\s+", " ", s)
+
+    # Remove leading greeting if present (avoid treating 'Hello' as a name)
+    parts = s_norm.split(maxsplit=1)
+    if parts and parts[0].lower().strip(",:") in _GREETINGS and len(parts) > 1:
+        s_norm = parts[1].strip()
+
+    # 1) Pattern: "Name, you ...", "Name you will ..." => map to Name
+    m = re.match(r"^([A-Z][a-z]{1,30})[,]\s*(you|your|please|we)\b(.*)", s_norm)
+    if m:
         person = m.group(1)
-        action = m.group(2).strip()
-        # trim trailing clauses that are too long: keep first clause
-        action = re.split(r"(?:\band\b|\bthen\b|[;:])", action, maxsplit=1)[0].strip()
-        return person, action
+        rest = m.group(3).strip()
+        # find short action in rest
+        # look for "your task is to ..." or verbs
+        mm = re.search(r"(?:your task is to|your task is|you will|you'll|you are to|please\s+)?\s*(.*)", rest, re.I)
+        action = mm.group(1).strip() if mm else rest
+        return person, _shorten_action(action)
 
-    # Patterns "John will do X", "Mark will be doing X", etc.
-    m2 = re.search(r"\b([A-Z][a-z]{1,24})\b.*?\b(will|shall|is going to|is to|will be|should|must|needs to|need to)\b\s*(.*)", s_norm, re.I)
-    if m2 and m2.group(3).strip():
+    # 2) Pattern: "Name will/do/should/must ...", "Name will be doing ..."
+    m2 = re.search(r"\b([A-Z][a-z]{1,30})\b(?:'s)?\s+(?:will|shall|should|must|needs to|need to|is to|is going to|will be|is)\b\s*(.*)", s_norm, re.I)
+    if m2:
         person = m2.group(1)
-        action = m2.group(3).strip()
-        action = re.split(r"(?:\band\b|\bthen\b|[;:])", action, maxsplit=1)[0].strip()
-        return person, action
+        action = m2.group(2).strip()
+        return person, _shorten_action(action)
 
-    # Imperatives that may include a direct object: "Please prepare the report by Friday"
-    m3 = re.search(r"^(?:please\s+)?\b(assign|prepare|send|submit|create|make|share|prepare|compile|deliver|complete|finish|report|present|analyse|analyze|clean|model|process)\b\s+(.*)", s_norm, re.I)
+    # 3) Pattern: "Your task is to ..." or "You need to ..." (no name -> general)
+    m3 = re.search(r"(?:your task is to|your task is|you need to|you will need to|you will need|you need)\s+(.*)", s_norm, re.I)
     if m3:
-        person = None
-        action = (m3.group(1) + " " + m3.group(2)).strip()
-        action = re.split(r"(?:\band\b|\bthen\b|[;:])", action, maxsplit=1)[0].strip()
-        return person, action
+        return None, _shorten_action(m3.group(1))
 
-    # Patterns like "Your task is to ...", no name
-    m4 = re.search(r"(?:your task is to|your task is|you will need to|you need to|you are to)\s+(.*)", s_norm, re.I)
+    # 4) Pattern: "Please X ..." or imperative verbs "Please prepare the report"
+    m4 = re.match(r"^(?:please\s+)?\b(assign|prepare|send|submit|create|make|share|compile|deliver|complete|finish|report|present|analyse|analyze|clean|model|process)\b\s*(.*)", s_norm, re.I)
     if m4:
-        action = m4.group(1).strip()
-        action = re.split(r"(?:\band\b|\bthen\b|[;:])", action, maxsplit=1)[0].strip()
-        return None, action
+        action = (m4.group(1) + " " + (m4.group(2) or "")).strip()
+        return None, _shorten_action(action)
 
-    # Last-resort: look for "X will" anywhere without a good tail
-    m5 = re.search(r"\b([A-Z][a-z]{1,24})\b.*\b(will|should|must|needs to|need to)\b", s_norm, re.I)
-    if m5:
-        person = m5.group(1)
-        # return the whole sentence trimmed if no small phrase found
-        return person, s_norm
+    # 5) If sentence contains a capitalized name and one of the action triggers nearby,
+    #    try to attribute: e.g., "John your work is to clean..." or "John will do X"
+    names = _likely_names(s_norm)
+    if names:
+        for name in names:
+            # look for patterns where the name is near an action trigger
+            if re.search(rf"\b{name}\b.*\b({'|'.join([re.escape(x) for x in _ACTION_TRIGGERS])})\b", s_norm, re.I):
+                # extract trailing clause after the trigger
+                # find the trigger location
+                trig_m = re.search(rf"\b{name}\b.*?\b({'|'.join([re.escape(x) for x in _ACTION_TRIGGERS])})\b\s*(.*)", s_norm, re.I)
+                if trig_m and trig_m.group(2):
+                    return name, _shorten_action(trig_m.group(2).strip())
+                # fallback: return sentence as action
+                return name, _shorten_action(s_norm)
 
-    # no person/action match; return None person and whole sentence as a candidate if it contains action keywords
-    if re.search(r"\b(will|should|must|need to|need|task|assign|please|due|deadline|report|deliver|submit|prepare|complete|clean|model)\b", s_norm, re.I):
-        return None, s_norm
+    # 6) fallback: if sentence contains action trigger anywhere, return general action
+    if any(re.search(rf"\b{re.escape(tok)}\b", s_norm, re.I) for tok in _ACTION_TRIGGERS):
+        return None, _shorten_action(s_norm)
 
     return None, None
 
 def summarize_transcript(transcript: str, max_sentences: int = 6):
     """
-    Returns: {"summary": str, "action_items": [str,...]}
-    Improved action extraction: shorter, person-aware items.
+    Returns {"summary": str, "action_items": [ ... ] }
     """
     if not transcript or not transcript.strip():
         return {"summary": "(no transcript provided)", "action_items": []}
@@ -610,46 +666,42 @@ def summarize_transcript(transcript: str, max_sentences: int = 6):
     if not sentences:
         sentences = [clean]
 
-    # Build a short summary (prefer sentences containing meeting/project triggers)
+    # Build summary: pick sentences with meeting/project triggers, else first N sentences
     triggers = ["discuss", "meeting", "project", "goal", "topic", "update", "overview", "decide", "plan"]
     important = [s for s in sentences if any(t in s.lower() for t in triggers)]
     if not important:
         important = sentences[:max_sentences]
     summary = " ".join(important[:max_sentences]).strip()
 
-    # Extract actions more carefully
+    # Extract actions
     person_tasks = defaultdict(list)
-    general_actions = []
+    general_tasks = []
     for s in sentences:
         person, action = _extract_person_action(s)
         if action:
-            # sanitize action string
-            action_clean = re.sub(r'\s+', ' ', action).strip().rstrip('.,;:')
             if person:
-                person_tasks[person].append(action_clean)
+                person_tasks[person].append(action)
             else:
-                general_actions.append(action_clean)
+                general_tasks.append(action)
 
-    # If we found nothing using the patterns, fallback to scanning for lines with action keywords
-    if not any(person_tasks.values()) and not general_actions:
+    # If no actions detected, try a looser pass (scan short clauses)
+    if not person_tasks and not general_tasks:
         for s in sentences:
-            if re.search(r"\b(will|should|must|need to|task|assign|please|due|deadline|report|deliver|submit|prepare|complete|clean|model)\b", s, re.I):
-                # prefer short first clause
-                short = re.split(r"(?:[;:]|\band\b|\bthen\b)", s, maxsplit=1)[0].strip()
-                general_actions.append(short)
+            if re.search(r"\b(" + "|".join([re.escape(t) for t in _ACTION_TRIGGERS]) + r")\b", s, re.I):
+                short = _shorten_action(s)
+                general_tasks.append(short)
 
-    # Format action items
+    # Format action items: Name: action, dedupe while preserving order
     action_items = []
     for person, tasks in person_tasks.items():
-        # dedupe
         seen = set()
         for t in tasks:
             if t not in seen:
                 seen.add(t)
                 action_items.append(f"{person}: {t}")
-    # append general actions
-    for ga in dict.fromkeys(general_actions).keys():
-        action_items.append(f"General: {ga}")
+
+    for t in dict.fromkeys(general_tasks).keys():
+        action_items.append(f"General: {t}")
 
     if not action_items:
         action_items = ["(no explicit action items detected)"]
