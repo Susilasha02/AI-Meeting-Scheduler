@@ -25,7 +25,7 @@ from google.auth.transport.requests import AuthorizedSession
 
 from dateutil import parser as dparse
 import dateparser  # pip install dateparser
-
+from dateparser.search import search_dates
 
 load_dotenv()
 
@@ -262,17 +262,8 @@ def _fairness_score(slot: Dict, fb: Dict[str, List[Dict]]) -> Tuple[float, Dict]
         "used_attendees": list(fb.keys())
     }
 
-# ---------- improved_natural_date_parse.py ----------
-import re
-from datetime import datetime, timedelta, time
-import zoneinfo
-import dateparser
-from dateparser.search import search_dates
-
-# If your app defines LOCAL_TZ and rfc3339 helper, keep using those.
-# Otherwise set a sensible default here:
-LOCAL_TZ = "Asia/Kolkata"    # <<-- change to your app LOCAL_TZ if needed
-
+# ---------- improved_natural_date_parse helpers ----------
+# Use the app-level LOCAL_TZ variable rather than hardcoding
 # Regex helpers
 DUR_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(hours|hour|hrs|hr|h|minutes|min|mins|m)\b", re.I)
 NEXT_WEEKDAY_RE = re.compile(r"\bnext\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", re.I)
@@ -284,13 +275,6 @@ WEEKDAY_MAP = {
     "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
     "friday": 4, "saturday": 5, "sunday": 6
 }
-
-def rfc3339(dt: datetime) -> str:
-    """Return RFC3339-like UTC string without timezone component (used by rest of app)."""
-    # If dt is naive, assume it's UTC already. The rest of your app seems to use naive UTC datetimes.
-    if dt.tzinfo is None:
-        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    return dt.astimezone(zoneinfo.ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def _parse_duration_minutes(prompt: str, default_min: int = 45) -> int:
     """Parse duration from text. returns minutes."""
@@ -346,15 +330,13 @@ def _apply_time_preferences(dt_date: datetime, prompt: str, local_tz: zoneinfo.Z
 
 def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_duration_min: int = 45):
     """
-    Main parser. Returns a dict:
+    Main parser. Returns a dict with keys:
       {
         "attendees": [...],
         "duration_min": int,
         "window_start": rfc3339(start_utc_naive),
         "window_end": rfc3339(end_utc_naive)
       }
-
-    contacts_map: optional mapping of lowercase names or teams handles to emails for attendee resolution.
     """
     p = (prompt or "").strip()
     if contacts_map is None:
@@ -379,7 +361,11 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
             attendees.add("@" + m)
 
     # timezone tools
-    local_tz = zoneinfo.ZoneInfo(LOCAL_TZ)
+    try:
+        local_tz = zoneinfo.ZoneInfo(LOCAL_TZ)
+    except Exception:
+        local_tz = zoneinfo.ZoneInfo("UTC")
+
     now_local = datetime.now(local_tz)
     # 1) try to find explicit date/time using dateparser.search.search_dates (future preference)
     try:
@@ -402,16 +388,28 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
             chosen_dt = dt
             break
         if chosen_dt:
-            # chosen_dt may be naive and possibly midnight if date-only.
-            # treat as local date/time (LOCAL_TZ)
-            # if chosen_dt has no hour/min (00:00), apply time preferences
-            if chosen_dt.hour == 0 and chosen_dt.minute == 0 and "00:" not in str(chosen_dt):
-                # build a local date and assign a time-of-day
+            # Normalize chosen_dt into local tz safely:
+            try:
+                if chosen_dt.tzinfo is None:
+                    chosen_dt = chosen_dt.replace(tzinfo=None)  # keep naive for now
+                    # If it's date-only midnight, we'll apply time preferences
+                else:
+                    chosen_dt = chosen_dt.astimezone(local_tz)
+            except Exception:
+                # defensive: if something odd, treat as naive
+                chosen_dt = chosen_dt.replace(tzinfo=None)
+
+            # if chosen_dt is date-only (hour==0/min==0) apply time prefs
+            if getattr(chosen_dt, "hour", 0) == 0 and getattr(chosen_dt, "minute", 0) == 0 and "00:" not in str(chosen_dt):
                 date_only = datetime(year=chosen_dt.year, month=chosen_dt.month, day=chosen_dt.day)
                 start_local = _apply_time_preferences(date_only, p, local_tz)
             else:
-                # has time component; treat as local
-                start_local = chosen_dt.replace(tzinfo=local_tz) if chosen_dt.tzinfo is None else chosen_dt.astimezone(local_tz)
+                # chosen_dt might be naive datetime; interpret as local
+                if chosen_dt.tzinfo is None:
+                    start_local = chosen_dt.replace(tzinfo=local_tz)
+                else:
+                    start_local = chosen_dt.astimezone(local_tz)
+
             start_utc = start_local.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
             end_utc = start_utc + timedelta(minutes=duration_min)
             return {
@@ -442,7 +440,6 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
     if m_this:
         weekday = m_this.group(1).lower()
         target = WEEKDAY_MAP[weekday]
-        # this-week means next occurrence that could be in the same week (not guaranteed strictly one week ahead)
         nextday = _next_weekday_after(now_local, target, at_least_one_week_ahead=False)
         start_local = _apply_time_preferences(nextday, p, local_tz)
         start_utc = start_local.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
@@ -489,6 +486,34 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
         "window_end": rfc3339(fallback_end)
     }
 
+# Wrapper parse_prompt to produce the config suggest() expects
+def parse_prompt(prompt: str, contacts_map: Dict[str, str] = None) -> Dict:
+    """
+    Produces a dict compatible with the /suggest body:
+      {
+        "attendees": [...],
+        "duration_min": int,
+        "buffer_min": int,
+        "window_start": "RFC3339",
+        "window_end": "RFC3339"
+      }
+    """
+    try:
+        parsed = parse_prompt_to_window(prompt, contacts_map or {}, default_duration_min=45)
+        # parsed already returns those fields; ensure buffer_min exists
+        parsed.setdefault("buffer_min", 15)
+        return parsed
+    except Exception:
+        # defensive fallback to rolling window to avoid crashes
+        logger.exception("parse_prompt failed for prompt: %s", prompt)
+        now = datetime.utcnow()
+        return {
+            "attendees": ["primary"],
+            "duration_min": 45,
+            "buffer_min": 15,
+            "window_start": rfc3339((now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)),
+            "window_end": rfc3339((now + timedelta(days=5)).replace(hour=18, minute=30, second=0, microsecond=0)),
+        }
 
 # ---------- summarizer for MoM ----------
 def summarize_transcript(transcript: str, max_sentences: int = 6):
@@ -576,14 +601,21 @@ def contacts_add(body: dict = Body(...)):
 def contacts_list():
     return load_contacts()
 
-# NL → suggest
+# NL → suggest (safer wrapper)
 @app.post("/nlp/suggest")
 def nlp_suggest(body: dict = Body(...)):
-    creds = load_creds(ORGANIZER_ID)
-    if not creds: return JSONResponse({"error": "not_connected"}, status_code=401)
-    prompt = body.get("prompt","").strip()
-    cfg = parse_prompt(prompt, load_contacts())
-    return suggest(cfg)
+    try:
+        creds = load_creds(ORGANIZER_ID)
+        if not creds:
+            return JSONResponse({"error": "not_connected"}, status_code=401)
+        prompt = body.get("prompt","").strip()
+        contacts_map = load_contacts()
+        cfg = parse_prompt(prompt, contacts_map)
+        # pass the cfg dict into suggest() - it expects a body-like dict
+        return suggest(cfg)
+    except Exception as e:
+        logger.error("Exception in /nlp/suggest: %s\n%s", str(e), traceback.format_exc())
+        return JSONResponse({"error": "server_error", "detail": str(e), "trace": traceback.format_exc()}, status_code=500)
 
 # Core suggest
 @app.post("/suggest")
@@ -674,6 +706,51 @@ def suggest(body: dict = Body(default={})):
         return JSONResponse({"error": "google_api_error", "detail": detail}, status_code=500)
     except Exception as e:
         return JSONResponse({"error": "server_error", "detail": str(e), "trace": traceback.format_exc()}, status_code=500)
+
+# Helper get_search_window_from_prompt used by /suggest when prompt_text exists
+def get_search_window_from_prompt(prompt: str, days_ahead: int = 7) -> Tuple[datetime, datetime]:
+    """
+    Determine a tz-aware local window for searching free slots based on prompt.
+    Returns (start_local_dt, end_local_dt) both tz-aware in LOCAL_TZ.
+    """
+    try:
+        tz = zoneinfo.ZoneInfo(LOCAL_TZ)
+    except Exception:
+        tz = zoneinfo.ZoneInfo("UTC")
+    now = datetime.now(tz)
+    p_low = (prompt or "").lower()
+    if "today" in p_low:
+        start = now
+        end = datetime(now.year, now.month, now.day, 23, 59, 59, tzinfo=tz)
+        return start, end
+    if "tomorrow" in p_low:
+        tomorrow = now + timedelta(days=1)
+        start = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 0, 0, 0, tzinfo=tz)
+        end = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 23, 59, 59, tzinfo=tz)
+        return start, end
+
+    # try to detect a date expression using dateparser.search
+    try:
+        sd = search_dates(prompt or "", settings={"PREFER_DATES_FROM": "future", "RELATIVE_BASE": datetime.utcnow()})
+        if sd:
+            dt = sd[0][1]
+            # if parsed dt is date-only, pick the whole date; else preserve time
+            if getattr(dt, "hour", 0) == 0 and getattr(dt, "minute", 0) == 0:
+                start_local = datetime(dt.year, dt.month, dt.day, 0, 0, 0, tzinfo=tz)
+                end_local = start_local + timedelta(days=1)
+                return start_local, end_local
+            else:
+                # ensure tz-aware in local tz
+                if dt.tzinfo is None:
+                    dt_local = dt.replace(tzinfo=tz)
+                else:
+                    dt_local = dt.astimezone(tz)
+                return dt_local, dt_local + timedelta(minutes=60)
+    except Exception:
+        pass
+
+    # default window
+    return now, now + timedelta(days=days_ahead)
 
 # Book
 @app.post("/book")
