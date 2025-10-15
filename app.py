@@ -516,18 +516,81 @@ def parse_prompt(prompt: str, contacts_map: Dict[str, str] = None) -> Dict:
         }
 
 # ---------- summarizer for MoM ----------
+from collections import defaultdict
+import re
+import nltk
+
+# Ensure punkt tokenizer available (run once on first start)
+try:
+    nltk.data.find("tokenizers/punkt")
+except LookupError:
+    nltk.download("punkt")
+
 def summarize_transcript(transcript: str, max_sentences: int = 6):
-    import re
-    sentences = re.split(r'(?<=[.!?])\s+', transcript.strip())
-    summary = ' '.join(sentences[:max_sentences]).strip()
-    actions = []
+    """
+    Create a richer MoM summary + explicit action items.
+    Uses keyword clustering & lightweight heuristics.
+    """
+    if not transcript.strip():
+        return {"summary": "(no transcript provided)", "action_items": []}
+
+    # Normalize whitespace and case
+    text = re.sub(r'\s+', ' ', transcript.strip())
+    sentences = nltk.sent_tokenize(text)
+    if not sentences:
+        return {"summary": "(no sentences detected)", "action_items": []}
+
+    # --- Extract possible action/task lines ---
+    action_phrases = []
     for s in sentences:
-        s_strip = s.strip()
-        if re.match(r'(?i)^(action|todo|task|follow up|follow-up|please|assign|will|should)\b', s_strip) or \
-           any(k in s_strip.lower() for k in ['action:', 'todo', 'follow up', 'please', 'should', 'will']):
-            actions.append(s_strip)
-    actions = list(dict.fromkeys(actions))
-    return {"summary": summary, "action_items": actions or []}
+        lower = s.lower()
+        # heuristics for detecting assignments/tasks
+        if any(k in lower for k in [
+            "will be", "take care", "responsible", "should", "must", 
+            "need to", "have to", "task", "action", "assign", "please"
+        ]):
+            action_phrases.append(s.strip())
+
+    # Deduplicate
+    seen = set()
+    actions = []
+    for a in action_phrases:
+        if a not in seen:
+            seen.add(a)
+            actions.append(a)
+
+    # --- Extract people + roles from action lines ---
+    person_tasks = defaultdict(list)
+    for a in actions:
+        # find names like "Asha", "Mark", or words before "will"
+        match = re.findall(r'\b([A-Z][a-z]+)\b.*?(will|take care|responsible|task|need|must)', a)
+        if match:
+            name = match[0][0]
+            person_tasks[name].append(a)
+        else:
+            person_tasks["General"].append(a)
+
+    # --- Build a compact summary ---
+    important_sentences = []
+    for s in sentences:
+        if any(k in s.lower() for k in ["discuss", "meeting", "project", "goal", "topic"]):
+            important_sentences.append(s)
+    # fallback: top N sentences
+    if not important_sentences:
+        important_sentences = sentences[:max_sentences]
+    summary = " ".join(important_sentences[:max_sentences]).strip()
+
+    # --- Create readable action list ---
+    action_items = []
+    for person, lines in person_tasks.items():
+        for l in lines:
+            clean = re.sub(r'[\s\n]+', ' ', l).strip()
+            action_items.append(f"{person}: {clean}")
+
+    return {
+        "summary": summary or "(no summary extracted)",
+        "action_items": action_items or ["(no explicit action items detected)"]
+    }
 
 # ---------- FastAPI ----------
 from fastapi.middleware.cors import CORSMiddleware
@@ -1077,7 +1140,7 @@ def get_mom(mom_id: str):
     # prepare actions list HTML
     actions = mom_record.get('mom',{}).get('action_items', [])
     if actions:
-        actions_html = "<ul>" + "".join(f"<li>{a}</li>" for a in actions) + "</ul>"
+        actions_html = "<ul style='line-height:1.6'>" + "".join(f"<li>{a}</li>" for a in actions) + "</ul>"
     else:
         actions_html = "<div style='color:#6b7280'>No action items detected.</div>"
 
