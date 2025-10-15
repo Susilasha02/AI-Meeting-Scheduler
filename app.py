@@ -1077,16 +1077,17 @@ def recorder_start_redirect(request: Request):
 
 
 # ---------- Recorder / upload endpoint (updated) ----------
+# ---------- Recorder / upload endpoint (updated) ----------
 @app.post("/upload-recording")
 async def upload_recording(request: Request):
     """
     Accepts:
       - JSON { meeting, owner, participant_email, transcript, final (opt) }
-      - multipart/form-data with 'meeting', 'owner', 'participant_email', and 'audio' file
+      - multipart/form-data with 'meeting', 'owner', 'participant_email', 'audio' file, optional 'transcript'
     Behavior:
       - Stores per-meeting aggregated data in MOMS/<meeting_hash>.json (participants -> transcripts)
       - Saves uploaded audio blobs to data/uploads/
-      - Returns {"status":"ok","mom_link": "..."} when transcript(s) exist
+      - Returns {"status":"ok","mom_link": "...", "mom": {...}} when transcript(s) exist
     """
     try:
         def meeting_hash(meeting_url: str) -> str:
@@ -1131,7 +1132,7 @@ async def upload_recording(request: Request):
             # optionally produce a short MoM immediately (summarizer used for whole meeting)
             # We'll generate a combined summary by concatenating participant transcripts.
             combined_text = "\n\n".join(
-                " ".join([t.get("text","") for t in rec.get("transcripts",[])])
+                " ".join([t.get("text","") for t in rec.get("transcripts",[])]).strip()
                 for rec in record["participants"].values()
             )
             mom = summarize_transcript(combined_text)
@@ -1150,38 +1151,83 @@ async def upload_recording(request: Request):
             return JSONResponse({"status":"ok","mom_link": mom_link, "mom": mom_record})
 
         else:
-            # form / multipart flow: upload audio blob + meeting + participant_email
+            # form / multipart flow: upload audio blob + meeting + participant_email (+ optional transcript)
             form = await request.form()
             meeting = form.get("meeting")
             owner = form.get("owner")
             participant = form.get("participant_email") or owner or "unknown"
             audio_file = form.get("audio")
+            transcript = form.get("transcript", "") or ""
+            final = True
+            ffinal = form.get("final")
+            if ffinal is not None:
+                final = str(ffinal).lower() not in ("0", "false", "no")
+
             if not meeting:
                 return JSONResponse({"error":"no_meeting"}, status_code=400)
-            if not audio_file:
-                return JSONResponse({"error":"no_audio"}, status_code=400)
+            if not audio_file and not transcript:
+                # allow transcript-only in some flows, but require at least audio OR transcript
+                return JSONResponse({"error":"no_audio_or_transcript"}, status_code=400)
 
-            # save audio
-            fname = f"{uuid.uuid4()}_{getattr(audio_file, 'filename', 'upload.webm')}"
-            dest = UPLOADS / fname
-            contents = await audio_file.read()
-            dest.write_bytes(contents)
+            # save audio if present
+            saved_audio_path = None
+            if audio_file:
+                fname = f"{uuid.uuid4()}_{getattr(audio_file, 'filename', 'upload.webm')}"
+                dest = UPLOADS / fname
+                contents = await audio_file.read()
+                dest.write_bytes(contents)
+                saved_audio_path = str(dest)
 
-            # update meeting record (participants -> audio_files)
+            # update meeting record (participants -> audio_files / transcripts)
             mid = meeting_hash(meeting)
             mom_file = MOMS / f"meeting_{mid}.json"
             if mom_file.exists():
                 record = json.loads(mom_file.read_text(encoding="utf-8"))
             else:
                 record = {"meeting": meeting, "owner": owner, "created_at": datetime.utcnow().isoformat() + "Z", "participants": {}}
+
             part = record["participants"].setdefault(participant, {"transcripts": [], "audio_files": []})
-            part["audio_files"].append({"path": str(dest), "uploaded_at": datetime.utcnow().isoformat() + "Z"})
+            if saved_audio_path:
+                part["audio_files"].append({"path": saved_audio_path, "uploaded_at": datetime.utcnow().isoformat() + "Z"})
+            if transcript:
+                part["transcripts"].append({
+                    "text": transcript,
+                    "uploaded_at": datetime.utcnow().isoformat() + "Z",
+                    "final": final
+                })
+
+            # persist the record
             mom_file.write_text(json.dumps(record, indent=2), encoding="utf-8")
 
-            return JSONResponse({"status":"ok","saved": str(dest)})
+            # If there are transcripts in the meeting record, generate the MoM immediately
+            combined_text = "\n\n".join(
+                " ".join([t.get("text","") for t in rec.get("transcripts",[])]).strip()
+                for rec in record["participants"].values()
+            ).strip()
+
+            if combined_text:
+                mom = summarize_transcript(combined_text)
+                mom_id = f"meeting_{mid}"
+                mom_path = MOMS / f"{mom_id}.json"
+                mom_record = {
+                    "id": mom_id,
+                    "meeting": meeting,
+                    "owner": owner,
+                    "created_at": datetime.utcnow().isoformat() + "Z",
+                    "participants": record["participants"],
+                    "mom": mom
+                }
+                mom_path.write_text(json.dumps(mom_record, indent=2), encoding="utf-8")
+                mom_link = f"{APP_BASE_URL}/mom/{mom_id}"
+                resp = {"status":"ok", "saved": saved_audio_path or "", "mom_link": mom_link, "mom": mom_record}
+                return JSONResponse(resp)
+
+            # otherwise return saved audio info
+            return JSONResponse({"status":"ok","saved": saved_audio_path or ""})
 
     except Exception as e:
         return JSONResponse({"error":"server_error","detail":str(e), "trace": traceback.format_exc()}, status_code=500)
+
 
 
 # ---------- MoM view (updated to show participants + transcripts) ----------
