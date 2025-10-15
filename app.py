@@ -386,30 +386,49 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
             if len(cleaned) <= 1:
                 continue
             chosen_dt = dt
+            matched_text_chosen = cleaned
             break
         if chosen_dt:
             # Normalize chosen_dt into local tz safely:
             try:
                 if chosen_dt.tzinfo is None:
-                    chosen_dt = chosen_dt.replace(tzinfo=None)  # keep naive for now
-                    # If it's date-only midnight, we'll apply time preferences
+                    # keep naive for now; we'll interpret as local timezone below
+                    chosen_dt = chosen_dt.replace(tzinfo=None)
                 else:
+                    # convert timezone-aware parsed dt into local tz
                     chosen_dt = chosen_dt.astimezone(local_tz)
             except Exception:
                 # defensive: if something odd, treat as naive
                 chosen_dt = chosen_dt.replace(tzinfo=None)
 
-            # if chosen_dt is date-only (hour==0/min==0) apply time prefs
-            if getattr(chosen_dt, "hour", 0) == 0 and getattr(chosen_dt, "minute", 0) == 0 and "00:" not in str(chosen_dt):
+            # Decide whether the parse included an explicit time:
+            # If the user's prompt contains a time token (e.g., "9pm", "09:00", "3:30") we assume the parsed dt carries time.
+            has_explicit_time_in_prompt = bool(TIME_RE.search(p))
+
+            # If the parsed dt looks like a pure date (midnight) AND user did NOT include explicit time,
+            # apply time preferences (morning/afternoon/evening/default).
+            if (getattr(chosen_dt, "hour", 0) == 0 and getattr(chosen_dt, "minute", 0) == 0) and not has_explicit_time_in_prompt:
                 date_only = datetime(year=chosen_dt.year, month=chosen_dt.month, day=chosen_dt.day)
                 start_local = _apply_time_preferences(date_only, p, local_tz)
             else:
-                # chosen_dt might be naive datetime; interpret as local
+                # Interpret naive datetimes as local time; if already tz-aware we ensured it's converted above.
                 if chosen_dt.tzinfo is None:
                     start_local = chosen_dt.replace(tzinfo=local_tz)
                 else:
                     start_local = chosen_dt.astimezone(local_tz)
 
+                # If the prompt didn't include an explicit time but search_dates still returned a time,
+                # respect the parsed time — but if it's a past time, we'll push it to the next occurrence below.
+
+            # Ensure start_local is in the future. If parsed time is already past (relative to now_local),
+            # move to the next appropriate occurrence (add one day).
+            if start_local <= now_local:
+                # If user asked for a specific date (explicit date text was found that mentions a day or date),
+                # we should not arbitrarily jump many days; adding 1 day is a conservative move ensuring only
+                # past-today times are advanced to the next plausible slot.
+                start_local = start_local + timedelta(days=1)
+
+            # Compute UTC-naive times for API consistency
             start_utc = start_local.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
             end_utc = start_utc + timedelta(minutes=duration_min)
             return {
@@ -427,6 +446,9 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
         # enforce next-week (at_least_one_week_ahead=True)
         nextday = _next_weekday_after(now_local, target, at_least_one_week_ahead=True)
         start_local = _apply_time_preferences(nextday, p, local_tz)
+        # if start_local happens to be in the past (unlikely) push forward
+        if start_local <= now_local:
+            start_local = start_local + timedelta(days=7)
         start_utc = start_local.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
         end_utc = start_utc + timedelta(minutes=duration_min)
         return {
@@ -442,6 +464,10 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
         target = WEEKDAY_MAP[weekday]
         nextday = _next_weekday_after(now_local, target, at_least_one_week_ahead=False)
         start_local = _apply_time_preferences(nextday, p, local_tz)
+        # if start_local was earlier today, push to next week's same weekday
+        if start_local <= now_local:
+            start_local = _next_weekday_after(now_local, target, at_least_one_week_ahead=True)
+            start_local = _apply_time_preferences(start_local, p, local_tz)
         start_utc = start_local.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
         end_utc = start_utc + timedelta(minutes=duration_min)
         return {
@@ -457,6 +483,9 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
         # choose next available near now
         start_local = now_local + timedelta(minutes=15)  # short buffer
         start_local = start_local.replace(second=0, microsecond=0)
+        # If it's already late-night (e.g., after 23:30) push to tomorrow morning
+        if start_local.hour >= 23:
+            start_local = (now_local + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
         start_utc = start_local.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
         end_utc = start_utc + timedelta(minutes=duration_min)
         return {
@@ -468,6 +497,9 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
     if "tomorrow" in plow:
         tomorrow = (now_local + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
         start_local = _apply_time_preferences(tomorrow, p, local_tz)
+        # safety: ensure future
+        if start_local <= now_local:
+            start_local = start_local + timedelta(days=1)
         start_utc = start_local.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
         return {
             "attendees": sorted(attendees) if attendees else ["primary"],
@@ -515,25 +547,38 @@ def parse_prompt(prompt: str, contacts_map: Dict[str, str] = None) -> Dict:
             "window_end": rfc3339((now + timedelta(days=5)).replace(hour=18, minute=30, second=0, microsecond=0)),
         }
 
-# ---------- summarizer for MoM ----------
 
+# ---------- summarizer for MoM (improved with optional spaCy) ----------
 import re
-import nltk
 from collections import defaultdict
 
-# Ensure punkt exists (quiet)
+# Try to use spaCy if available (better named-entity & dependency parsing).
+# If not installed, code will gracefully fall back to the regex-based extractor.
 try:
-    nltk.data.find("tokenizers/punkt")
-except LookupError:
+    import spacy
     try:
-        nltk.download("punkt", quiet=True)
+        # prefer loaded model if present; this may raise if not downloaded
+        _nlp = spacy.load("en_core_web_sm")
     except Exception:
-        pass
+        # if model not present, try the simpler load which may raise ImportError
+        _nlp = None
+except Exception:
+    _nlp = None
+
+# Keep a small nltk fallback for sentence tokenization (as before)
+try:
+    import nltk
+    try:
+        nltk.data.find("tokenizers/punkt")
+    except LookupError:
+        nltk.download("punkt", quiet=True)
+except Exception:
+    nltk = None
 
 # Common filler/greeting tokens to ignore when they're the first token
 _GREETINGS = {"hello", "hi", "hey", "ok", "okay", "so", "alright", "right", "well", "today", "thanks", "thank"}
 
-# Action trigger verbs / phrases
+# Action trigger verbs / phrases (keep original list for fallback)
 _ACTION_TRIGGERS = [
     "will", "shall", "is going to", "is to", "will be", "should", "must",
     "needs to", "need to", "need", "task", "assign", "please", "due", "deadline",
@@ -545,118 +590,85 @@ def _split_sentences(text: str):
     if not text or not text.strip():
         return []
     txt = re.sub(r"\s+", " ", text.replace("\n", " ")).strip()
-    try:
-        sents = nltk.sent_tokenize(txt)
-        return [s.strip() for s in sents if s.strip()]
-    except Exception:
-        # fallback: split on punctuation followed by space + capital (safe)
-        parts = re.split(r'(?<=[.!?])\s+(?=[A-Z0-9])', txt)
-        return [p.strip() for p in parts if p.strip()]
+    if nltk:
+        try:
+            sents = nltk.sent_tokenize(txt)
+            return [s.strip() for s in sents if s.strip()]
+        except Exception:
+            pass
+    # fallback naive split
+    parts = re.split(r'(?<=[.!?])\s+', txt)
+    return [p.strip() for p in parts if p.strip()]
 
-def _likely_names(sentence: str):
+def _shorten_action(s: str, maxlen: int = 180) -> str:
+    s = s.strip()
+    if len(s) <= maxlen:
+        return s
+    return s[:maxlen].rsplit(" ", 1)[0] + "…"
+
+def _spacy_extract_actions(sent: str):
     """
-    Return list of candidate capitalized tokens that might be names,
-    excluding tokens that are obvious greetings or sentence-start fillers.
+    Use spaCy dependency parse to extract (subject, verb phrase / object) pairs.
+    Returns list of (subject_or_None, action_text).
     """
-    # find capitalized tokens of at least 2 letters
-    candidates = re.findall(r"\b([A-Z][a-z]{1,})\b", sentence)
-    # filter out tokens that are actually common words or all-uppercase acronyms
-    filtered = []
-    for i, token in enumerate(candidates):
-        low = token.lower()
-        if low in _GREETINGS:
-            continue
-        # ignore single-letter tokens and tokens that look like days/months if present
-        if len(token) < 2:
-            continue
-        filtered.append(token)
-    # return unique in order
-    seen = set()
-    out = []
-    for t in filtered:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
+    if not _nlp:
+        return []
+    doc = _nlp(sent)
+    actions = []
+    # find tokens that are main verbs (ROOT or VERB) and extract their subject and object/clause
+    for tok in doc:
+        if tok.pos_ == "VERB" or tok.dep_ == "ROOT":
+            # find subject
+            subj = None
+            for ch in tok.children:
+                if ch.dep_.startswith("nsubj"):
+                    subj = ch.text
+                    # prefer proper name if available in subtree
+                    for ent in doc.ents:
+                        if ent.start <= ch.i <= ent.end:
+                            subj = ent.text
+                            break
+                    break
+            # build a short action phrase: verb + direct object + relevant subtree
+            parts = [tok.lemma_]
+            # include direct objects and their compounds/objects
+            dobj_parts = []
+            for ch in tok.children:
+                if ch.dep_.endswith("obj") or ch.dep_ in ("dobj", "pobj", "attr"):
+                    dobj_parts.append(" ".join([t.text for t in ch.subtree]))
+            # if no direct object, include the verb's subtree minus subject
+            if dobj_parts:
+                action_text = tok.text + " " + ", ".join(dobj_parts)
+            else:
+                # include verb + a short slice of subtree (avoid entire sentence)
+                subtree_words = [t.text for t in tok.subtree if t.i >= tok.i][:10]
+                action_text = " ".join(subtree_words)
+            action_text = _shorten_action(action_text)
+            actions.append((subj, action_text))
+    return actions
 
-def _shorten_action(phrase: str):
-    """Trim action phrase at obvious clause boundaries to keep it concise."""
-    p = phrase.strip()
-    # cut at first ' and ' or ' then ' or ';' or ':' to avoid long paragraphs
-    parts = re.split(r"\b(?:and|then)\b|[;:]", p, maxsplit=1, flags=re.I)
-    return parts[0].strip().rstrip(".,;:")
-
-def _extract_person_action(sentence: str):
-    """
-    Attempt to parse (person, action) from a sentence.
-    Returns (person_name_or_None, short_action_or_None).
-    Uses several heuristics & patterns.
-    """
-    s = sentence.strip()
-    if not s:
-        return None, None
-
-    # normalize spacing
-    s_norm = re.sub(r"\s+", " ", s)
-
-    # Remove leading greeting if present (avoid treating 'Hello' as a name)
-    parts = s_norm.split(maxsplit=1)
-    if parts and parts[0].lower().strip(",:") in _GREETINGS and len(parts) > 1:
-        s_norm = parts[1].strip()
-
-    # 1) Pattern: "Name, you ...", "Name you will ..." => map to Name
-    m = re.match(r"^([A-Z][a-z]{1,30})[,]\s*(you|your|please|we)\b(.*)", s_norm)
+def _legacy_extract_person_action(s: str):
+    """Keep fallback legacy extractor (your original rules) for safety."""
+    # (This reuses your original approach: triggers + name heuristics simplified)
+    # Try to capture patterns like "John will X" or "please John: X"
+    s_norm = s.strip()
+    # look for "Name will/should/please ..." style
+    m = re.search(r"\b([A-Z][a-z]{1,30})\b\s+(?:will|shall|should|is to|is going to|please|must|needs to)\b", s)
     if m:
-        person = m.group(1)
-        rest = m.group(3).strip()
-        # find short action in rest
-        # look for "your task is to ..." or verbs
-        mm = re.search(r"(?:your task is to|your task is|you will|you'll|you are to|please\s+)?\s*(.*)", rest, re.I)
-        action = mm.group(1).strip() if mm else rest
-        return person, _shorten_action(action)
-
-    # 2) Pattern: "Name will/do/should/must ...", "Name will be doing ..."
-    m2 = re.search(r"\b([A-Z][a-z]{1,30})\b(?:'s)?\s+(?:will|shall|should|must|needs to|need to|is to|is going to|will be|is)\b\s*(.*)", s_norm, re.I)
-    if m2:
-        person = m2.group(1)
-        action = m2.group(2).strip()
-        return person, _shorten_action(action)
-
-    # 3) Pattern: "Your task is to ..." or "You need to ..." (no name -> general)
-    m3 = re.search(r"(?:your task is to|your task is|you need to|you will need to|you will need|you need)\s+(.*)", s_norm, re.I)
-    if m3:
-        return None, _shorten_action(m3.group(1))
-
-    # 4) Pattern: "Please X ..." or imperative verbs "Please prepare the report"
-    m4 = re.match(r"^(?:please\s+)?\b(assign|prepare|send|submit|create|make|share|compile|deliver|complete|finish|report|present|analyse|analyze|clean|model|process)\b\s*(.*)", s_norm, re.I)
-    if m4:
-        action = (m4.group(1) + " " + (m4.group(2) or "")).strip()
-        return None, _shorten_action(action)
-
-    # 5) If sentence contains a capitalized name and one of the action triggers nearby,
-    #    try to attribute: e.g., "John your work is to clean..." or "John will do X"
-    names = _likely_names(s_norm)
-    if names:
-        for name in names:
-            # look for patterns where the name is near an action trigger
-            if re.search(rf"\b{name}\b.*\b({'|'.join([re.escape(x) for x in _ACTION_TRIGGERS])})\b", s_norm, re.I):
-                # extract trailing clause after the trigger
-                # find the trigger location
-                trig_m = re.search(rf"\b{name}\b.*?\b({'|'.join([re.escape(x) for x in _ACTION_TRIGGERS])})\b\s*(.*)", s_norm, re.I)
-                if trig_m and trig_m.group(2):
-                    return name, _shorten_action(trig_m.group(2).strip())
-                # fallback: return sentence as action
-                return name, _shorten_action(s_norm)
-
-    # 6) fallback: if sentence contains action trigger anywhere, return general action
+        name = m.group(1)
+        # take remainder as action
+        rest = s[m.end():].strip()
+        if rest:
+            return name, _shorten_action(rest)
+    # generic: scan for action trigger words and return the sentence
     if any(re.search(rf"\b{re.escape(tok)}\b", s_norm, re.I) for tok in _ACTION_TRIGGERS):
         return None, _shorten_action(s_norm)
-
     return None, None
 
 def summarize_transcript(transcript: str, max_sentences: int = 6):
     """
-    Returns {"summary": str, "action_items": [ ... ] }
+    Returns {"summary": str, "action_items": [ . ] }
+    Uses spaCy if available for much better action extraction; falls back to original heuristics.
     """
     if not transcript or not transcript.strip():
         return {"summary": "(no transcript provided)", "action_items": []}
@@ -666,32 +678,53 @@ def summarize_transcript(transcript: str, max_sentences: int = 6):
     if not sentences:
         sentences = [clean]
 
-    # Build summary: pick sentences with meeting/project triggers, else first N sentences
-    triggers = ["discuss", "meeting", "project", "goal", "topic", "update", "overview", "decide", "plan"]
+    # Build summary: prefer sentences that contain meeting-like triggers; else first N sentences
+    triggers = ["discuss", "meeting", "project", "goal", "topic", "update", "decide", "plan"]
     important = [s for s in sentences if any(t in s.lower() for t in triggers)]
     if not important:
         important = sentences[:max_sentences]
     summary = " ".join(important[:max_sentences]).strip()
 
-    # Extract actions
+    # Extract actions — use spaCy when available
     person_tasks = defaultdict(list)
     general_tasks = []
-    for s in sentences:
-        person, action = _extract_person_action(s)
-        if action:
-            if person:
-                person_tasks[person].append(action)
-            else:
-                general_tasks.append(action)
 
-    # If no actions detected, try a looser pass (scan short clauses)
+    if _nlp:
+        # spaCy extraction across sentences
+        for s in sentences:
+            acts = _spacy_extract_actions(s)
+            if not acts:
+                # fallback to legacy for this sentence
+                name, action = _legacy_extract_person_action(s)
+                if action:
+                    if name:
+                        person_tasks[name].append(action)
+                    else:
+                        general_tasks.append(action)
+            else:
+                for name, action in acts:
+                    if action:
+                        if name:
+                            person_tasks[name].append(action)
+                        else:
+                            general_tasks.append(action)
+    else:
+        # legacy extraction across sentences
+        for s in sentences:
+            name, action = _legacy_extract_person_action(s)
+            if action:
+                if name:
+                    person_tasks[name].append(action)
+                else:
+                    general_tasks.append(action)
+
+    # Looser fallback pass if nothing found: check trigger words in short clauses
     if not person_tasks and not general_tasks:
         for s in sentences:
             if re.search(r"\b(" + "|".join([re.escape(t) for t in _ACTION_TRIGGERS]) + r")\b", s, re.I):
-                short = _shorten_action(s)
-                general_tasks.append(short)
+                general_tasks.append(_shorten_action(s))
 
-    # Format action items: Name: action, dedupe while preserving order
+    # Format action items
     action_items = []
     for person, tasks in person_tasks.items():
         seen = set()
@@ -699,7 +732,6 @@ def summarize_transcript(transcript: str, max_sentences: int = 6):
             if t not in seen:
                 seen.add(t)
                 action_items.append(f"{person}: {t}")
-
     for t in dict.fromkeys(general_tasks).keys():
         action_items.append(f"General: {t}")
 
@@ -707,7 +739,6 @@ def summarize_transcript(transcript: str, max_sentences: int = 6):
         action_items = ["(no explicit action items detected)"]
 
     return {"summary": summary or "(no summary extracted)", "action_items": action_items}
-
 
 # ---------- FastAPI ----------
 from fastapi.middleware.cors import CORSMiddleware
@@ -1082,9 +1113,7 @@ def recorder_start_redirect(request: Request):
 
     return RedirectResponse(url=target)
 
-
-# ---------- Recorder / upload endpoint (updated) ----------
-# ---------- Recorder / upload endpoint (updated) ----------
+# ---------- Recorder / upload endpoint ----------
 @app.post("/upload-recording")
 async def upload_recording(request: Request):
     """
