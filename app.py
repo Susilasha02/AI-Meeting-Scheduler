@@ -710,47 +710,83 @@ def suggest(body: dict = Body(default={})):
 # Helper get_search_window_from_prompt used by /suggest when prompt_text exists
 def get_search_window_from_prompt(prompt: str, days_ahead: int = 7) -> Tuple[datetime, datetime]:
     """
-    Determine a tz-aware local window for searching free slots based on prompt.
+    Determine a tz-aware local window for searching free slots based on natural prompt.
     Returns (start_local_dt, end_local_dt) both tz-aware in LOCAL_TZ.
+    Handles 'today', 'tomorrow', weekdays, 'next week', and explicit dates.
     """
     try:
         tz = zoneinfo.ZoneInfo(LOCAL_TZ)
     except Exception:
         tz = zoneinfo.ZoneInfo("UTC")
     now = datetime.now(tz)
-    p_low = (prompt or "").lower()
-    if "today" in p_low:
-        start = now
-        end = datetime(now.year, now.month, now.day, 23, 59, 59, tzinfo=tz)
-        return start, end
-    if "tomorrow" in p_low:
-        tomorrow = now + timedelta(days=1)
-        start = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 0, 0, 0, tzinfo=tz)
-        end = datetime(tomorrow.year, tomorrow.month, tomorrow.day, 23, 59, 59, tzinfo=tz)
+    p = (prompt or "").lower().strip()
+
+    # --- Handle simple relative words ---
+    if "today" in p:
+        start = now.replace(hour=9, minute=0, second=0, microsecond=0)
+        end = now.replace(hour=18, minute=30, second=0, microsecond=0)
         return start, end
 
-    # try to detect a date expression using dateparser.search
+    if "tomorrow" in p:
+        tomorrow = now + timedelta(days=1)
+        start = tomorrow.replace(hour=9, minute=0, second=0, microsecond=0)
+        end = tomorrow.replace(hour=18, minute=30, second=0, microsecond=0)
+        return start, end
+
+    # --- Handle "in X days" ---
+    m_in = re.search(r"in\s+(\d+)\s+day", p)
+    if m_in:
+        delta = int(m_in.group(1))
+        target = now + timedelta(days=delta)
+        start = target.replace(hour=9, minute=0, second=0, microsecond=0)
+        end = target.replace(hour=18, minute=30, second=0, microsecond=0)
+        return start, end
+
+    # --- Handle "next week" ---
+    if "next week" in p:
+        start = (now + timedelta(days=(7 - now.weekday()))).replace(hour=9, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=5, hours=9, minutes=30)
+        return start, end
+
+    # --- Handle weekdays ("next Wednesday", "this Monday", plain "Friday") ---
+    for word, idx in WEEKDAY_MAP.items():
+        if f"next {word}" in p:
+            target = now + timedelta((idx - now.weekday()) % 7 + 7)
+            start = target.replace(hour=9, minute=0, second=0, microsecond=0)
+            end = target.replace(hour=18, minute=30, second=0, microsecond=0)
+            return start, end
+        if f"this {word}" in p:
+            target = now + timedelta((idx - now.weekday()) % 7)
+            start = target.replace(hour=9, minute=0, second=0, microsecond=0)
+            end = target.replace(hour=18, minute=30, second=0, microsecond=0)
+            return start, end
+        # plain weekday mention (e.g., "Wednesday") → nearest future weekday
+        if re.search(rf"\b{word}\b", p):
+            days_ahead_calc = (idx - now.weekday()) % 7
+            if days_ahead_calc == 0:
+                days_ahead_calc = 7
+            target = now + timedelta(days=days_ahead_calc)
+            start = target.replace(hour=9, minute=0, second=0, microsecond=0)
+            end = target.replace(hour=18, minute=30, second=0, microsecond=0)
+            return start, end
+
+    # --- Handle explicit date with dateparser ---
     try:
         sd = search_dates(prompt or "", settings={"PREFER_DATES_FROM": "future", "RELATIVE_BASE": datetime.utcnow()})
         if sd:
             dt = sd[0][1]
-            # if parsed dt is date-only, pick the whole date; else preserve time
-            if getattr(dt, "hour", 0) == 0 and getattr(dt, "minute", 0) == 0:
-                start_local = datetime(dt.year, dt.month, dt.day, 0, 0, 0, tzinfo=tz)
-                end_local = start_local + timedelta(days=1)
-                return start_local, end_local
-            else:
-                # ensure tz-aware in local tz
-                if dt.tzinfo is None:
-                    dt_local = dt.replace(tzinfo=tz)
-                else:
-                    dt_local = dt.astimezone(tz)
-                return dt_local, dt_local + timedelta(minutes=60)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=tz)
+            start = dt.replace(hour=9, minute=0, second=0, microsecond=0)
+            end = start.replace(hour=18, minute=30)
+            return start, end
     except Exception:
         pass
 
-    # default window
-    return now, now + timedelta(days=days_ahead)
+    # --- Default fallback ---
+    start = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=days_ahead)
+    return start, end
 
 # Book
 @app.post("/book")
