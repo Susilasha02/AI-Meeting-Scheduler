@@ -516,155 +516,110 @@ def parse_prompt(prompt: str, contacts_map: Dict[str, str] = None) -> Dict:
         }
 
 # ---------- summarizer for MoM ----------
-# ---------- summarizer for MoM ----------
-from collections import defaultdict
-import re
-# keep existing import if present
-try:
-    import nltk
-    _have_nltk = True
-except Exception:
-    nltk = None
-    _have_nltk = False
 
-# Defensive: do not crash if punkt not installed. prefer NLTK if present, else fallback regex.
+import re
+import nltk
+from collections import defaultdict
+
+# --- Ensure punkt tokenizer is available safely ---
+try:
+    nltk.data.find("tokenizers/punkt")
+except LookupError:
+    try:
+        nltk.download("punkt", quiet=True)
+    except Exception as e:
+        print("⚠️ Could not download punkt automatically:", e)
+
 def _split_sentences(text: str):
     """
-    Try NLTK sentence tokenizer first; if punkt data missing or NLTK not available,
-    fall back to a robust regex-based splitter.
-    Returns list of sentences (stripped).
+    Robust sentence splitter using NLTK if available; regex fallback otherwise.
+    Always returns a list of clean sentences.
     """
-    text = text.strip()
-    if not text:
+    if not text or not text.strip():
         return []
-    # Try NLTK
-    if _have_nltk:
-        try:
-            # ensure punkt is present; if not available, this may raise LookupError
-            try:
-                nltk.data.find("tokenizers/punkt")
-            except LookupError:
-                # try to download quietly (best-effort). If this environment blocks downloads, fallback below.
-                try:
-                    nltk.download("punkt", quiet=True)
-                except Exception:
-                    pass
-            # tokenization
-            sentences = nltk.sent_tokenize(text)
-            # filter empties and strip
-            return [s.strip() for s in sentences if s.strip()]
-        except Exception:
-            # any problem: fall through to regex fallback
-            pass
 
-    # Regex fallback:
-    # Split on sentence-ending punctuation while keeping abbreviations simple
-    # This is not perfect but robust offline.
-    # We split where we have [.?!] followed by space and uppercase or end-of-string.
-    # Additionally, ensure not to break on common abbreviations (Mr., Dr., e.g., i.e.)
-    abbrev = r"(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs|e\.g|i\.e|etc|U\.S|U\.K)\."
-    pattern = re.compile(rf"(?<!\b{abbrev})([.?!])\s+")
-    parts = pattern.split(text)
-    # pattern.split returns pieces; we reconstruct sentences
-    sentences = []
-    cur = ""
-    for i in range(0, len(parts)):
-        cur += parts[i]
-        # if this part is punctuation, append next piece as same sentence ended
-        if parts[i] in ".?!" or (i+1 < len(parts) and parts[i+1] in ".?!"):
-            # strip punctuation at end - but keep it for readability
-            s = cur.strip()
-            if s:
-                sentences.append(s)
-            cur = ""
-    if cur.strip():
-        sentences.append(cur.strip())
-    # final cleanup
-    return [s.strip() for s in sentences if s.strip()]
+    text = text.strip().replace("\n", " ")
+    text = re.sub(r"\s+", " ", text)
+
+    # Try NLTK first
+    try:
+        sentences = nltk.sent_tokenize(text)
+        return [s.strip() for s in sentences if s.strip()]
+    except Exception as e:
+        print("⚠️ NLTK failed, using regex fallback:", e)
+
+    # Fallback regex (safe fixed-width lookbehind/lookahead)
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", text)
+    return [p.strip() for p in parts if p.strip()]
 
 
 def summarize_transcript(transcript: str, max_sentences: int = 6):
     """
-    Create a richer MoM summary + explicit action items.
-    Uses NLTK if available, otherwise uses regex-based sentence splitting.
+    Generates a concise summary and extracts action items from transcript text.
+    Uses NLTK for sentence tokenization and heuristic keyword detection.
     """
     if not transcript or not transcript.strip():
         return {"summary": "(no transcript provided)", "action_items": []}
 
-    # Normalize whitespace and unify into a single paragraph
-    clean = re.sub(r'\s+', ' ', transcript.strip())
+    # Clean and normalize
+    clean = re.sub(r"\s+", " ", transcript.strip())
 
-    # Sentence split (robust)
+    # Split sentences
     sentences = _split_sentences(clean)
     if not sentences:
-        # aggressive fallback: split by comma chunks if even that fails
-        sentences = [s.strip() for s in re.split(r'[;,\n]', clean) if s.strip()]
+        sentences = [clean]
 
-    # --- Extract possible action/task lines ---
-    action_phrases = []
-    # heuristics tuned to typical spoken assignment phrases
+    # --- Extract action items ---
     action_keywords = [
         "will", "will be", "take care", "responsible", "should", "must",
-        "need to", "have to", "task", "action", "assign", "please", "deliver",
-        "submit", "due", "by the end", "by end", "until", "deadline"
+        "need to", "have to", "task", "action", "assign", "please",
+        "deliver", "submit", "due", "deadline", "report", "complete", "finish"
     ]
+    action_lines = []
     for s in sentences:
         lower = s.lower()
         if any(k in lower for k in action_keywords):
-            action_phrases.append(s.strip())
+            action_lines.append(s.strip())
 
-    # Deduplicate preserve order
-    seen = set()
-    actions = []
-    for a in action_phrases:
-        a_norm = re.sub(r'\s+', ' ', a).strip()
-        if a_norm not in seen:
-            seen.add(a_norm)
-            actions.append(a_norm)
+    # Deduplicate actions (order-preserving)
+    seen, actions = set(), []
+    for a in action_lines:
+        norm = re.sub(r"\s+", " ", a)
+        if norm not in seen:
+            seen.add(norm)
+            actions.append(norm)
 
-    # --- Extract people + tasks from action lines ---
+    # --- Assign actions to people ---
     person_tasks = defaultdict(list)
     for a in actions:
-        # Look for capitalized tokens (names) or patterns like "Asha your task"
-        # Try a few heuristics:
-        # 1) Name followed by 'your' or token 'will' etc.
-        m = re.search(r'\b([A-Z][a-z]{1,24})\b(?:[,:\s]+(?:your|will|should|are|shall|must|task))', a)
+        # Try to detect a name (capitalized word before "will", "task", etc.)
+        m = re.search(r"\b([A-Z][a-z]{1,24})\b(?:[,:\s]+(?:will|should|must|task|please|responsible))", a)
         if m:
-            name = m.group(1)
-            person_tasks[name].append(a)
-            continue
-        # 2) "assign X to Y" pattern
-        m2 = re.search(r'(?:assign|assigning)\s+(?:to\s+)?([A-Z][a-z]{1,24})', a)
-        if m2:
-            person_tasks[m2.group(1)].append(a)
-            continue
-        # 3) last resort: look for known pronouns + roles → general
-        person_tasks["General"].append(a)
+            person_tasks[m.group(1)].append(a)
+        else:
+            person_tasks["General"].append(a)
 
-    # --- Build a compact summary ---
-    important_sentences = []
-    summary_triggers = ["discuss", "meeting", "project", "goal", "topic", "decide", "plan", "overview", "agenda"]
-    for s in sentences:
-        if any(t in s.lower() for t in summary_triggers):
-            important_sentences.append(s)
-    # fallback: top N sentences
-    if not important_sentences:
-        important_sentences = sentences[:max_sentences]
-    summary = " ".join(important_sentences[:max_sentences]).strip()
+    # --- Select summary sentences ---
+    summary_triggers = [
+        "discuss", "meeting", "project", "goal", "topic", "decide", "plan",
+        "overview", "agenda", "update", "progress"
+    ]
+    important = [s for s in sentences if any(t in s.lower() for t in summary_triggers)]
+    if not important:
+        important = sentences[:max_sentences]
 
-    # --- Create readable action list ---
+    summary = " ".join(important[:max_sentences]).strip()
+
+    # --- Format readable action list ---
     action_items = []
     for person, lines in person_tasks.items():
         for l in lines:
-            clean_line = re.sub(r'[\s\n]+', ' ', l).strip()
+            clean_line = re.sub(r"\s+", " ", l).strip()
             action_items.append(f"{person}: {clean_line}")
-
-    if not action_items:
-        action_items = []
 
     return {
         "summary": summary or "(no summary extracted)",
-        "action_items": action_items
+        "action_items": action_items or ["(no explicit action items detected)"]
     }
 
 # ---------- FastAPI ----------
