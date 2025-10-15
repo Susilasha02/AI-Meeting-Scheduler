@@ -1018,23 +1018,90 @@ def get_mom(mom_id: str):
     if not mom_file.exists():
         return HTMLResponse("<h3>MoM not found</h3>", status_code=404)
     mom_record = json.loads(mom_file.read_text(encoding="utf-8"))
-    html = f"<div style='font-family:Inter,Arial;padding:18px;max-width:900px;margin:20px auto;'>"
-    html += f"<h2>Minutes of Meeting</h2><p><strong>Meeting:</strong> {mom_record.get('meeting')}</p>"
-    html += f"<p><strong>Owner:</strong> {mom_record.get('owner')}</p>"
-    html += f"<h3>Summary</h3><p>{mom_record.get('mom',{}).get('summary','(no summary)')}</p>"
-    html += "<h3>Action Items</h3><ul>"
-    for a in mom_record.get('mom',{}).get('action_items', []):
-        html += f"<li>{a}</li>"
-    html += "</ul><hr>"
-    html += "<h3>Participant transcripts & files</h3>"
+
+    # Build a small, pleasant HTML layout
+    html = """
+    <!doctype html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8"/>
+      <meta name="viewport" content="width=device-width,initial-scale=1"/>
+      <title>MoM - {title}</title>
+      <style>
+        body{{font-family:Inter,system-ui,Arial;background:#f6f8fb;margin:0;padding:24px;color:#111}}
+        .card{{max-width:980px;margin:24px auto;background:#fff;border-radius:12px;padding:22px;box-shadow:0 10px 30px rgba(20,20,40,0.06)}}
+        h1{{margin:0 0 6px;font-size:20px}}
+        .meta{{color:#6b7280;font-size:13px;margin-bottom:12px}}
+        .section{{margin-top:18px}}
+        .actions{{display:flex;gap:8px;flex-wrap:wrap}}
+        .chip{{background:#eef2ff;color:#0f172a;padding:8px 10px;border-radius:8px;font-weight:600;font-size:13px}}
+        .summary{{background:#fbfdff;padding:14px;border-radius:8px;border:1px solid #eef2ff}}
+        .participant{{margin-top:12px;padding:12px;border-left:3px solid #eef2ff;background:#fff;border-radius:6px}}
+        pre{{white-space:pre-wrap;font-family:inherit;background:#fafbff;padding:12px;border-radius:8px;border:1px solid #f1f5f9}}
+        footer{{color:#7b7f86;margin-top:16px;font-size:13px}}
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <h1>Minutes of Meeting</h1>
+        <div class="meta">Owner: {owner} • Created: {created}</div>
+
+        <div class="section">
+          <div style="display:flex;align-items:center;justify-content:space-between">
+            <div>
+              <div style="font-weight:700;margin-bottom:6px">Summary</div>
+              <div class="summary">{summary}</div>
+            </div>
+            <div class="actions">
+              <a href="{meeting}" target="_blank" class="chip">Open original meeting</a>
+            </div>
+          </div>
+        </div>
+
+        <div class="section">
+          <div style="font-weight:700;margin-bottom:8px">Action Items</div>
+          {actions_html}
+        </div>
+
+        <div class="section">
+          <div style="font-weight:700;margin-bottom:8px">Participant transcripts & files</div>
+          {participants_html}
+        </div>
+
+        <footer>Generated at {created}</footer>
+      </div>
+    </body>
+    </html>
+    """.strip()
+
+    # prepare actions list HTML
+    actions = mom_record.get('mom',{}).get('action_items', [])
+    if actions:
+        actions_html = "<ul>" + "".join(f"<li>{a}</li>" for a in actions) + "</ul>"
+    else:
+        actions_html = "<div style='color:#6b7280'>No action items detected.</div>"
+
+    # participants
+    parts_html = ""
     for p_email, pdata in mom_record.get('participants', {}).items():
-        html += f"<h4>{p_email}</h4>"
+        parts_html += f"<div class='participant'><div style='font-weight:700'>{p_email}</div>"
         for i, t in enumerate(pdata.get('transcripts', [])):
-            text = t.get('text','')
+            text = t.get('text','(empty)')
             uploaded = t.get('uploaded_at','')
-            html += f"<div style='border:1px solid #eee;padding:8px;margin-bottom:6px;'><strong>Transcript #{i+1} ({uploaded})</strong><pre style='white-space:pre-wrap;font-family:inherit'>{text}</pre></div>"
+            parts_html += f"<div style='margin-top:8px'><div style='font-weight:600;font-size:13px'>Transcript #{i+1} <span style='color:#6b7280;font-weight:400;font-size:12px'>{uploaded}</span></div><pre>{text}</pre></div>"
         for af in pdata.get('audio_files', []):
             path = af.get('path')
-            html += f"<div>Audio file: <code>{path}</code></div>"
-    html += f"<hr><p><em>Generated at {mom_record.get('created_at')}</em></p></div>"
+            parts_html += f"<div style='margin-top:8px;color:#6b7280'>Audio file: <code>{path}</code></div>"
+        parts_html += "</div>"
+
+    html = html.format(
+        title = mom_record.get('meeting','Meeting'),
+        owner = mom_record.get('owner','-'),
+        created = mom_record.get('created_at','-'),
+        summary = mom_record.get('mom',{}).get('summary','(no summary)'),
+        meeting = mom_record.get('meeting',''),
+        actions_html = actions_html,
+        participants_html = parts_html
+    )
     return HTMLResponse(html)
+
