@@ -5,27 +5,32 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Recorder — AI Meeting Scheduler</title>
   <style>
-    :root{
-      --bg:#f6f8fb; --card:#fff; --accent:#6f46f6; --muted:#6b7280; --radius:14px; --maxwidth:1100px;
+    :root {
+      --bg: #f6f8fb;
+      --card: #fff;
+      --accent: #6f46f6;
+      --muted: #6b7280;
+      --radius: 14px;
+      --maxwidth: 1100px;
     }
-    html,body{height:100%;margin:0;font-family:Inter,system-ui,Segoe UI,Roboto,"Helvetica Neue",Arial;background:var(--bg);color:#111}
-    .wrap{min-height:100%;display:flex;align-items:center;justify-content:center;padding:32px;box-sizing:border-box}
-    .card{width:100%;max-width:var(--maxwidth);background:var(--card);border-radius:var(--radius);padding:28px;box-shadow:0 6px 30px rgba(23,25,33,0.06)}
-    .header{display:flex;align-items:center;gap:12px;margin-bottom:16px}
-    .logo{width:56px;height:56px;border-radius:10px;background:linear-gradient(135deg,#6f46f6,#b794f4);display:flex;align-items:center;justify-content:center;color:white;font-weight:700;font-size:18px}
-    h1{margin:0;font-size:20px}
-    p.lead{margin:6px 0 18px;color:var(--muted);font-size:14px}
-    .controls{display:flex;gap:12px;align-items:center;margin-bottom:18px}
-    button{padding:10px 16px;border-radius:10px;border:0;cursor:pointer;font-weight:600}
-    .btn-primary{background:var(--accent);color:white}
-    .btn-ghost{background:transparent;color:var(--accent);border:1px solid rgba(111,70,246,0.12)}
-    .status{color:var(--muted);font-size:13px}
-    .wave{width:100%;height:86px;background:linear-gradient(180deg,#f8fafc,#fff);border-radius:10px;border:1px dashed #e6e9ef;display:flex;align-items:center;justify-content:center;color:#9aa3b2;margin-bottom:18px;padding:12px;box-sizing:border-box}
-    .transcript{min-height:80px; max-height:260px; overflow:auto; padding:14px; background:#fafbff; border-radius:10px; border:1px solid #eef2ff; color:#111; font-size:14px; line-height:1.7}
-    .muted{color:var(--muted);font-size:13px}
-    .row{display:flex;gap:12px;align-items:center}
-    a.momlink{color:var(--accent); text-decoration:none; border:1px solid rgba(111,70,246,0.08); padding:8px 12px; border-radius:8px; background:#fff}
-    .hint{color:#9aa3b2;font-size:13px;margin-top:8px}
+    html,body { height:100%; margin:0; font-family:Inter,system-ui,Segoe UI,Roboto,"Helvetica Neue",Arial; background:var(--bg); color:#111; }
+    .wrap { min-height:100%; display:flex; align-items:center; justify-content:center; padding:32px; box-sizing:border-box; }
+    .card { width:100%; max-width:var(--maxwidth); background:var(--card); border-radius:var(--radius); padding:28px; box-shadow:0 6px 30px rgba(23,25,33,0.06); }
+    .header { display:flex; align-items:center; gap:12px; margin-bottom:16px; }
+    .logo { width:56px; height:56px; border-radius:10px; background:linear-gradient(135deg,#6f46f6,#b794f4); display:flex; align-items:center; justify-content:center; color:white; font-weight:700; font-size:18px; }
+    h1 { margin:0; font-size:20px; }
+    p.lead { margin:6px 0 18px; color:var(--muted); font-size:14px; }
+    .controls { display:flex; gap:12px; align-items:center; margin-bottom:18px; }
+    button { padding:10px 16px; border-radius:10px; border:0; cursor:pointer; font-weight:600; }
+    .btn-primary { background:var(--accent); color:white; }
+    .btn-ghost { background:transparent; color:var(--accent); border:1px solid rgba(111,70,246,0.12); }
+    .status { color:var(--muted); font-size:13px; }
+    .wave { width:100%; height:86px; background:linear-gradient(180deg,#f8fafc,#fff); border-radius:10px; border:1px dashed #e6e9ef; display:flex; align-items:center; justify-content:center; color:#9aa3b2; margin-bottom:18px; }
+    .transcript { max-height:260px; overflow:auto; padding:12px; background:#fafbff; border-radius:10px; border:1px solid #eef2ff; color:#111; font-size:14px; line-height:1.45; }
+    .muted { color:var(--muted); font-size:13px; }
+    .controls-right { margin-left:auto; color:var(--muted); font-size:13px; }
+    .notice { color: #6b7280; font-size:13px; margin-top:10px; }
+    .link { color:var(--accent); text-decoration:none; border-radius:8px; background:#f1eaff;padding:8px 10px;font-weight:600 }
   </style>
 </head>
 <body>
@@ -33,10 +38,11 @@
     <div class="card" role="main">
       <div class="header">
         <div class="logo">TS</div>
-        <div>
+        <div style="flex:1">
           <h1>Meeting Recorder</h1>
           <p class="lead">Automatically records meeting audio and generates transcript / MoM. Auto-starts when possible — click to give microphone permission if required.</p>
         </div>
+        <div class="controls-right" id="uploadStatus">Idle</div>
       </div>
 
       <div class="controls">
@@ -52,32 +58,41 @@
 
       <div style="height:14px;"></div>
       <div class="muted">Upload / Save</div>
-      <div style="margin-top:10px; display:flex; gap:10px; align-items:center;">
+      <div style="margin-top:10px;display:flex;gap:10px;align-items:center;">
         <button id="uploadBtn" class="btn-ghost" disabled>Upload Audio & Transcript</button>
-        <button id="openMom" class="btn-ghost" style="display:none">Open MoM</button>
+        <button id="openMomBtn" class="btn-ghost" style="display:none">Open MoM</button>
+        <a id="momLink" href="#" target="_blank" style="display:none;margin-left:8px"></a>
       </div>
-      <div class="hint" id="momHint" style="margin-top:10px; display:none;"></div>
+      <div class="notice" id="notice"></div>
     </div>
   </div>
 
 <script>
+/* Recorder + Transcription Script
+   - Auto-attempts start on load
+   - Uses audio constraints with echoCancellation/noiseSuppression/autoGainControl
+   - Single MediaRecorder instance and single Web Speech Recognition
+   - Simple dedupe logic to avoid repeated phrases, and joins recognized segments into a paragraph
+*/
 (async function(){
   const statusEl = document.getElementById('status');
-  const startBtn  = document.getElementById('btnStart');
-  const stopBtn   = document.getElementById('btnStop');
-  const wave      = document.getElementById('wave');
+  const startBtn = document.getElementById('btnStart');
+  const stopBtn = document.getElementById('btnStop');
+  const wave = document.getElementById('wave');
   const transcriptEl = document.getElementById('transcript');
   const uploadBtn = document.getElementById('uploadBtn');
-  const openMomBtn = document.getElementById('openMom');
-  const momHint = document.getElementById('momHint');
+  const uploadStatus = document.getElementById('uploadStatus');
+  const notice = document.getElementById('notice');
+  const openMomBtn = document.getElementById('openMomBtn');
+  const momLinkEl = document.getElementById('momLink');
 
-  const APP_BASE = (window.APP_BASE_URL || '').replace(/\/$/,'') || location.origin;
-
-  let mediaStream = null, recorder = null, recordedChunks = [];
+  let mediaStream = null;
+  let recorder = null;
+  let recordedChunks = [];
   let recognition = null;
-  let liveTranscript = "";      // single paragraph joined by spaces
-  let lastNormalized = "";      // dedupe only if identical
-  let lastAddTime = 0;
+  let liveTranscript = "";
+  let lastRecognizedNormalized = ""; // for dedupe
+  const APP_BASE = (window.APP_BASE_URL || '').replace(/\/$/,'') || location.origin;
 
   // audio constraints optimized for meetings
   const constraints = {
@@ -90,34 +105,43 @@
     }
   };
 
-  function updateStatus(t){ statusEl.textContent = t; }
-  function showWave(msg){ wave.textContent = msg; }
-  function normalize(s){ return (s||"").trim().toLowerCase().replace(/\s+/g,' '); }
-
-  function appendToParagraph(text){
-    if(!text) return;
-    const cleaned = text.trim();
-    if(!cleaned) return;
-    const norm = normalize(cleaned);
-    // tiny dedupe: if identical to lastNormalized, ignore
-    if(norm === lastNormalized) return;
-    // remove repeated immediate words inside the chunk
-    const deduped = cleaned.split(' ').filter((w,i,arr) => !(i>0 && arr[i-1]===w)).join(' ');
-    if(liveTranscript === "" || liveTranscript === "No transcript yet."){
-      liveTranscript = deduped;
-    } else {
-      // join with space — keep as one paragraph
-      liveTranscript = liveTranscript.trim() + " " + deduped;
-    }
-    lastNormalized = norm;
-    transcriptEl.textContent = liveTranscript;
+  function updateStatus(t){
+    statusEl.textContent = t;
   }
 
+  function showWave(msg){
+    wave.textContent = msg;
+  }
+
+  function _normalize(s){
+    return s.trim().toLowerCase().replace(/\s+/g,' ');
+  }
+
+  function appendTranscriptPiece(piece){
+    if(!piece) return;
+    const cleaned = piece.trim();
+    if(!cleaned) return;
+    const normalized = _normalize(cleaned);
+    // dedupe identical repeats
+    if(normalized === lastRecognizedNormalized) return;
+    lastRecognizedNormalized = normalized;
+    // join into paragraph (separate by a single space)
+    if(!liveTranscript) {
+      liveTranscript = cleaned;
+      transcriptEl.textContent = cleaned;
+    } else {
+      // avoid double spaces
+      liveTranscript = liveTranscript.trim() + " " + cleaned;
+      transcriptEl.textContent = liveTranscript;
+    }
+  }
+
+  // Start mic + media recorder
   async function startRecording(){
     updateStatus('Requesting microphone...');
     try{
       mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
-    } catch(err){
+    }catch(err){
       updateStatus('Microphone permission required.');
       showWave('Click "Start Recording" to give mic permission.');
       throw err;
@@ -127,24 +151,26 @@
 
     recordedChunks = [];
     recorder = new MediaRecorder(mediaStream, { mimeType: 'audio/webm;codecs=opus' });
-
-    recorder.ondataavailable = e => { if(e.data && e.data.size) recordedChunks.push(e.data); };
+    recorder.ondataavailable = e => {
+      if(e.data && e.data.size > 0) recordedChunks.push(e.data);
+    };
     recorder.onstart = () => {
       updateStatus('Recording');
       startBtn.disabled = true;
       stopBtn.disabled = false;
       showWave('Recording… (audio is being captured)');
-      uploadBtn.disabled = true;
+      uploadStatus.textContent = 'Recording';
     };
     recorder.onstop = () => {
       updateStatus('Stopped');
       startBtn.disabled = false;
       stopBtn.disabled = true;
       showWave('Recording stopped. Ready to upload.');
-      uploadBtn.disabled = recordedChunks.length === 0;
+      uploadBtn.disabled = false;
+      uploadStatus.textContent = 'Ready to upload';
     };
 
-    recorder.start(1000); // chunk every 1s
+    recorder.start(1000); // collect chunks every 1s
     startSpeechRecognition();
   }
 
@@ -157,113 +183,123 @@
     stopSpeechRecognition();
   }
 
-  // Web Speech API
+  // Web Speech API recognition with single instance
   function startSpeechRecognition(){
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if(!SpeechRecognition) {
-      appendToParagraph("[Browser does not support Web Speech API — transcripts will be uploaded for server-side transcription]");
+      appendTranscriptPiece("[Browser does not support Web Speech API — transcripts will be uploaded for server-side transcription]");
       return;
     }
     if(recognition) return;
-
     recognition = new SpeechRecognition();
-    recognition.interimResults = false;   // only final results (avoid duplicates)
+    recognition.interimResults = false;
     recognition.continuous = true;
     recognition.lang = 'en-US';
 
-    recognition.onstart = ()=>{ console.log('Speech recognition started'); };
-    recognition.onerror = (ev)=>{ console.warn('Speech recognition error',ev); };
-    recognition.onend = ()=>{
-      // if still recording, restart (some browsers stop periodically)
-      if(recorder && recorder.state === 'recording'){
-        try{ recognition.start(); }catch(e){ console.warn('restart recognition failed',e); }
+    recognition.onstart = () => { console.log('Speech recognition started'); }
+    recognition.onerror = (ev) => { console.warn('Speech recognition error', ev); }
+    recognition.onend = () => {
+      if(recorder && recorder.state === 'recording') {
+        try { recognition.start(); } catch(e){ console.warn('restart recognition failed',e); }
       }
     };
-    recognition.onresult = (evt)=>{
-      for(let i=evt.resultIndex;i<evt.results.length;i++){
+
+    recognition.onresult = (evt) => {
+      for(let i=evt.resultIndex; i<evt.results.length; ++i){
         if(evt.results[i].isFinal){
           const text = evt.results[i][0].transcript;
-          appendToParagraph(text);
+          // small cleaning: remove leading filler words repeated etc.
+          appendTranscriptPiece(text);
         }
       }
     };
-    try{ recognition.start(); }catch(e){ console.warn('Recognition start failed',e); }
+
+    try{
+      recognition.start();
+    }catch(e){
+      console.warn('Recognition start failed', e);
+    }
   }
 
   function stopSpeechRecognition(){
     if(recognition){
-      try{ recognition.onend = null; recognition.stop(); }catch(e){}
+      try { recognition.onend = null; recognition.stop(); } catch(e){}
       recognition = null;
     }
   }
 
-  // get meeting & owner from querystring
-  function qsParam(name){ const u = new URL(location.href); return u.searchParams.get(name) || ""; }
-  const meetingParam = decodeURIComponent(qsParam('meeting') || qsParam('meeting'.toLowerCase()) || '');
-  const ownerParam   = decodeURIComponent(qsParam('owner') || qsParam('owner'.toLowerCase()) || '');
-
-  async function uploadRecording(){
-    if(recordedChunks.length === 0){
-      alert('No audio recorded yet.');
-      return;
-    }
-    updateStatus('Uploading audio & transcript...');
-    showWave('Uploading…');
-    const blob = new Blob(recordedChunks, { type: 'audio/webm' });
-
-    // Build the JSON payload expected by your /upload-recording endpoint:
-    // { meeting, owner, participant_email, transcript, final }
-    const payload = {
-      meeting: meetingParam || '',
-      owner: ownerParam || '',
-      participant_email: ownerParam || 'unknown',
-      transcript: (liveTranscript || "").trim(),
-      final: true
-    };
-
-    // We'll upload audio as multipart first (so server still gets audio file), but your app's /upload-recording accepts JSON OR multipart.
-    // Use form with 'audio' + JSON fields so server will accept the audio and transcript.
-    const form = new FormData();
-    form.append('meeting', payload.meeting);
-    form.append('owner', payload.owner);
-    form.append('participant_email', payload.participant_email);
-    form.append('transcript', payload.transcript);
-    form.append('final', 'true');
-    form.append('audio', blob, 'meeting_recording.webm');
-
+  // read query params meeting + owner + participant_email
+  function getParams(){
     try{
-      const resp = await fetch(APP_BASE + '/upload-recording', { method:'POST', body: form });
-      const j = await resp.json();
-      if(!resp.ok){
-        throw new Error(JSON.stringify(j));
-      }
-      updateStatus('Upload complete');
-      showWave('Upload successful.');
-      // server returns mom_link and mom record — show link & button
-      if(j.mom_link){
-        momHint.style.display = 'block';
-        momHint.innerHTML = 'MoM (may be available shortly): <a class="momlink" href="'+j.mom_link+'" target="_blank">'+j.mom_link+'</a>';
-        openMomBtn.style.display = 'inline-block';
-        openMomBtn.onclick = ()=>{ window.open(j.mom_link, '_blank'); };
-      } else if(j.mom && j.mom.id){
-        const mlink = APP_BASE + '/mom/' + j.mom.id;
-        momHint.style.display = 'block';
-        momHint.innerHTML = 'MoM: <a class="momlink" href="'+mlink+'" target="_blank">'+mlink+'</a>';
-        openMomBtn.style.display = 'inline-block';
-        openMomBtn.onclick = ()=>{ window.open(mlink, '_blank'); };
-      } else {
-        momHint.style.display = 'block';
-        momHint.innerText = 'Upload succeeded — but no MoM link returned (server may generate shortly).';
-      }
-      alert('Upload successful.');
-    }catch(err){
-      updateStatus('Upload failed');
-      showWave('Upload failed — check console and server logs.');
-      console.error(err);
-      alert('Upload failed: ' + (err.message || err));
+      const qs = new URLSearchParams(location.search);
+      return {
+        meeting: qs.get('meeting') || qs.get('m') || location.href,
+        owner: qs.get('owner') || qs.get('o') || undefined,
+        participant_email: qs.get('participant_email') || undefined
+      };
+    }catch(e){
+      return { meeting: location.href };
     }
   }
 
+  // Upload JSON endpoint
+  async function uploadRecording(){
+    if(recordedChunks.length === 0 && !liveTranscript){
+      alert('No audio or transcript recorded yet.');
+      return;
+    }
+    uploadBtn.disabled = true;
+    uploadStatus.textContent = 'Uploading...';
+    notice.textContent = '';
+    const blob = recordedChunks.length ? new Blob(recordedChunks, { type: 'audio/webm' }) : null;
+    const params = getParams();
+
+    // prefer JSON flow: { meeting, owner, participant_email, transcript }
+    const payload = {
+      meeting: params.meeting,
+      owner: params.owner,
+      participant_email: params.participant_email,
+      transcript: liveTranscript || "",
+      final: true
+    };
+
+    try{
+      // Attempt JSON POST first
+      const resp = await fetch(APP_BASE + '/upload-recording', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await resp.json().catch(()=>({}));
+      if(!resp.ok){
+        throw new Error(JSON.stringify(data) || resp.statusText);
+      }
+      uploadStatus.textContent = 'Upload successful.';
+      notice.textContent = 'Upload successful.';
+      // If server returned mom_link, show it
+      if(data && data.mom_link){
+        momLinkEl.href = data.mom_link;
+        momLinkEl.textContent = data.mom_link;
+        momLinkEl.style.display = 'inline';
+        openMomBtn.style.display = 'inline-block';
+        openMomBtn.onclick = ()=> window.open(data.mom_link, '_blank');
+        notice.innerHTML += ' <br/>MoM available: <a href="'+data.mom_link+'" target="_blank">'+data.mom_link+'</a>';
+      } else {
+        // no mom_link yet — server may generate shortly
+        notice.textContent = 'Upload succeeded — but no MoM link returned (server may generate shortly).';
+      }
+      alert('Upload successful.');
+    }catch(err){
+      console.error(err);
+      uploadStatus.textContent = 'Upload failed';
+      notice.textContent = 'Upload failed: ' + (err.message || err);
+      alert('Upload failed: ' + (err.message || err));
+    } finally {
+      uploadBtn.disabled = false;
+    }
+  }
+
+  // Auto-start attempt on page load
   async function autoStart(){
     try{
       await startRecording();
@@ -275,32 +311,28 @@
     }
   }
 
-  startBtn.addEventListener('click', async ()=>{
+  // Hook up UI
+  startBtn.addEventListener('click', async (e) => {
     startBtn.disabled = true;
-    try{ await startRecording(); } catch(err){ startBtn.disabled = false; console.error(err); }
-  });
-  stopBtn.addEventListener('click', ()=>{ stopRecording(); });
-  uploadBtn.addEventListener('click', ()=>uploadRecording());
-
-  // Show Open MoM if URL already has a mom id (same page used by redirect)
-  const existingMom = qsParam('mom');
-  if(existingMom){
-    openMomBtn.style.display = 'inline-block';
-    openMomBtn.onclick = ()=>{ window.open(APP_BASE + '/mom/' + encodeURIComponent(existingMom), '_blank'); };
-    momHint.style.display = 'block';
-    momHint.innerHTML = 'MoM: <a class="momlink" href="'+APP_BASE + '/mom/'+encodeURIComponent(existingMom)+'" target="_blank">'+APP_BASE + '/mom/'+encodeURIComponent(existingMom)+'</a>';
-  }
-
-  // Enable upload button when we have something to upload
-  const enableUploadObserver = new MutationObserver(()=>{
-    if(recordedChunks.length > 0 || (liveTranscript && liveTranscript.length>10)){
-      uploadBtn.disabled = false;
+    try {
+      await startRecording();
+    } catch(err) {
+      startBtn.disabled = false;
+      console.error(err);
     }
   });
-  enableUploadObserver.observe(transcriptEl, { childList:true, subtree:true, characterData:true });
 
-  // Attempt auto-start (some browsers require user gesture)
+  stopBtn.addEventListener('click', (e) => {
+    stopRecording();
+  });
+
+  uploadBtn.addEventListener('click', (e) => {
+    uploadRecording();
+  });
+
+  // Try auto-start after a tick
   setTimeout(autoStart, 700);
+
 })();
 </script>
 </body>

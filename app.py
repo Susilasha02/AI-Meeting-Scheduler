@@ -516,191 +516,156 @@ def parse_prompt(prompt: str, contacts_map: Dict[str, str] = None) -> Dict:
         }
 
 # ---------- summarizer for MoM ----------
+# ---------- summarizer for MoM ----------
 from collections import defaultdict
 import re
-import nltk
-
-# Ensure punkt tokenizer available (run once on first start)
+# keep existing import if present
 try:
-    nltk.data.find("tokenizers/punkt")
-except LookupError:
-    nltk.download("punkt")
+    import nltk
+    _have_nltk = True
+except Exception:
+    nltk = None
+    _have_nltk = False
+
+# Defensive: do not crash if punkt not installed. prefer NLTK if present, else fallback regex.
+def _split_sentences(text: str):
+    """
+    Try NLTK sentence tokenizer first; if punkt data missing or NLTK not available,
+    fall back to a robust regex-based splitter.
+    Returns list of sentences (stripped).
+    """
+    text = text.strip()
+    if not text:
+        return []
+    # Try NLTK
+    if _have_nltk:
+        try:
+            # ensure punkt is present; if not available, this may raise LookupError
+            try:
+                nltk.data.find("tokenizers/punkt")
+            except LookupError:
+                # try to download quietly (best-effort). If this environment blocks downloads, fallback below.
+                try:
+                    nltk.download("punkt", quiet=True)
+                except Exception:
+                    pass
+            # tokenization
+            sentences = nltk.sent_tokenize(text)
+            # filter empties and strip
+            return [s.strip() for s in sentences if s.strip()]
+        except Exception:
+            # any problem: fall through to regex fallback
+            pass
+
+    # Regex fallback:
+    # Split on sentence-ending punctuation while keeping abbreviations simple
+    # This is not perfect but robust offline.
+    # We split where we have [.?!] followed by space and uppercase or end-of-string.
+    # Additionally, ensure not to break on common abbreviations (Mr., Dr., e.g., i.e.)
+    abbrev = r"(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs|e\.g|i\.e|etc|U\.S|U\.K)\."
+    pattern = re.compile(rf"(?<!\b{abbrev})([.?!])\s+")
+    parts = pattern.split(text)
+    # pattern.split returns pieces; we reconstruct sentences
+    sentences = []
+    cur = ""
+    for i in range(0, len(parts)):
+        cur += parts[i]
+        # if this part is punctuation, append next piece as same sentence ended
+        if parts[i] in ".?!" or (i+1 < len(parts) and parts[i+1] in ".?!"):
+            # strip punctuation at end - but keep it for readability
+            s = cur.strip()
+            if s:
+                sentences.append(s)
+            cur = ""
+    if cur.strip():
+        sentences.append(cur.strip())
+    # final cleanup
+    return [s.strip() for s in sentences if s.strip()]
+
 
 def summarize_transcript(transcript: str, max_sentences: int = 6):
     """
-    NLTK-based summarizer + action-item extractor.
-
-    Returns:
-      {"summary": "...", "action_items": [ "Person: action", ... ]}
-
-    Notes:
-      - Requires NLTK and the corpora: punkt, averaged_perceptron_tagger, maxent_ne_chunker, words.
-      - The function will attempt to download missing data at runtime if needed.
+    Create a richer MoM summary + explicit action items.
+    Uses NLTK if available, otherwise uses regex-based sentence splitting.
     """
-    import re
-    try:
-        import nltk
-        from nltk import word_tokenize, pos_tag, ne_chunk
-        from nltk.tree import Tree
-    except Exception as ex:
-        # If nltk is not available for some reason, return a graceful fallback
-        return {"summary": "(nltk not available)", "action_items": []}
-
-    # ensure required corpora are present (download if missing)
-    try:
-        nltk.data.find("tokenizers/punkt")
-    except LookupError:
-        nltk.download("punkt")
-    try:
-        nltk.data.find("taggers/averaged_perceptron_tagger")
-    except LookupError:
-        nltk.download("averaged_perceptron_tagger")
-    try:
-        nltk.data.find("chunkers/maxent_ne_chunker")
-    except LookupError:
-        nltk.download("maxent_ne_chunker")
-    try:
-        nltk.data.find("corpora/words")
-    except LookupError:
-        nltk.download("words")
-
-    txt = (transcript or "").strip()
-    if not txt:
+    if not transcript or not transcript.strip():
         return {"summary": "(no transcript provided)", "action_items": []}
 
-    # Normalize whitespace
-    clean = re.sub(r'\s+', ' ', txt).strip()
+    # Normalize whitespace and unify into a single paragraph
+    clean = re.sub(r'\s+', ' ', transcript.strip())
 
-    # Sentence tokenize
-    sentences = nltk.sent_tokenize(clean)
+    # Sentence split (robust)
+    sentences = _split_sentences(clean)
     if not sentences:
-        return {"summary": "(no sentences detected)", "action_items": []}
+        # aggressive fallback: split by comma chunks if even that fails
+        sentences = [s.strip() for s in re.split(r'[;,\n]', clean) if s.strip()]
 
-    # Lowercase copy for quick keyword checks
-    lowers = [s.lower() for s in sentences]
-
-    # Keyword list for detecting action sentences (expandable)
-    ACTION_KEYWORDS = {
-        "assign", "assigned", "assigning", "please", "action", "todo", "task",
-        "follow up", "follow-up", "followup", "due", "deadline", "should",
-        "must", "need to", "we will", "you will", "you'll", "will", "shall",
-        "deliver", "submit", "prepare", "implement", "complete", "send", "share",
-        "take care", "responsible", "owner"
-    }
-
-    # Score sentences for importance:
-    # - sentences containing action keywords get strong weight
-    # - otherwise weight by number of content words (nouns/adjectives/verbs)
-    sent_scores = []
-    for i, s in enumerate(sentences):
-        s_low = lowers[i]
-        score = 0
-        # count keyword hits (phrase and token checking)
-        for kw in ACTION_KEYWORDS:
-            if kw in s_low:
-                score += 10
-        # POS based content-word count
-        try:
-            toks = word_tokenize(s)
-            tags = pos_tag(toks)
-            content_count = sum(1 for _w, p in tags if p.startswith("NN") or p.startswith("VB") or p.startswith("JJ"))
-            score += content_count / 5.0
-        except Exception:
-            # fallback: length-based
-            score += min(len(s.split())/20.0, 2.0)
-        sent_scores.append((score, i, s))
-
-    # Pick top sentences for summary (preserve original order)
-    top = sorted(sent_scores, key=lambda x: x[0], reverse=True)[:max_sentences]
-    top_indices = sorted([t[1] for t in top])
-    summary_sentences = [sentences[idx] for idx in top_indices]
-    summary = " ".join(summary_sentences).strip()
-    if not summary:
-        summary = sentences[0] if sentences else "(no summary available)"
-
-    # --- Action item extraction ---
-    action_items = []
-    seen_actions = set()
-
-    # Helper: extract PERSON names using NE chunking from a sentence
-    def extract_person_names(sentence):
-        names = []
-        try:
-            toks = word_tokenize(sentence)
-            tags = pos_tag(toks)
-            tree = ne_chunk(tags, binary=False)
-            for subtree in tree:
-                if isinstance(subtree, Tree) and subtree.label() == "PERSON":
-                    name = " ".join([tok for tok, _ in subtree.leaves()])
-                    names.append(name)
-        except Exception:
-            # fallback: simple capitalized-word heuristic
-            caps = re.findall(r'\b([A-Z][a-z]{1,})\b', sentence)
-            for c in caps:
-                # exclude common sentence-start words that are not names
-                if c.lower() not in {"This".lower(), "The".lower(), "We".lower(), "I".lower(), "It".lower()}:
-                    names.append(c)
-        return list(dict.fromkeys(names))  # unique preserving order
-
-    # Extract action-like sentences (any sentence with keywords)
+    # --- Extract possible action/task lines ---
+    action_phrases = []
+    # heuristics tuned to typical spoken assignment phrases
+    action_keywords = [
+        "will", "will be", "take care", "responsible", "should", "must",
+        "need to", "have to", "task", "action", "assign", "please", "deliver",
+        "submit", "due", "by the end", "by end", "until", "deadline"
+    ]
     for s in sentences:
-        s_low = s.lower()
-        # detect presence of any action keyword (phrase-level check)
-        is_action = False
-        for kw in ACTION_KEYWORDS:
-            if kw in s_low:
-                is_action = True
-                break
-        # also consider sentences with modal verbs + verb phrase (e.g., "you should prepare")
-        if not is_action:
-            if re.search(r'\b(should|must|need to|have to|will)\b', s_low):
-                is_action = True
+        lower = s.lower()
+        if any(k in lower for k in action_keywords):
+            action_phrases.append(s.strip())
 
-        if not is_action:
+    # Deduplicate preserve order
+    seen = set()
+    actions = []
+    for a in action_phrases:
+        a_norm = re.sub(r'\s+', ' ', a).strip()
+        if a_norm not in seen:
+            seen.add(a_norm)
+            actions.append(a_norm)
+
+    # --- Extract people + tasks from action lines ---
+    person_tasks = defaultdict(list)
+    for a in actions:
+        # Look for capitalized tokens (names) or patterns like "Asha your task"
+        # Try a few heuristics:
+        # 1) Name followed by 'your' or token 'will' etc.
+        m = re.search(r'\b([A-Z][a-z]{1,24})\b(?:[,:\s]+(?:your|will|should|are|shall|must|task))', a)
+        if m:
+            name = m.group(1)
+            person_tasks[name].append(a)
             continue
-
-        # Clean candidate and dedupe
-        candidate = re.sub(r'\s+', ' ', s).strip()
-        if len(candidate) < 8:
+        # 2) "assign X to Y" pattern
+        m2 = re.search(r'(?:assign|assigning)\s+(?:to\s+)?([A-Z][a-z]{1,24})', a)
+        if m2:
+            person_tasks[m2.group(1)].append(a)
             continue
-        key = candidate.lower()
-        if key in seen_actions:
-            continue
-        seen_actions.add(key)
+        # 3) last resort: look for known pronouns + roles → general
+        person_tasks["General"].append(a)
 
-        # Try to attribute to person(s)
-        persons = extract_person_names(candidate)
-        if persons:
-            # produce one action per person if multiple names present -
-            # if sentence uses "you", keep as generic
-            if len(persons) == 1:
-                action_items.append(f"{persons[0]}: {candidate}")
-            else:
-                # multiple persons - attach sentence as-is, prefix with names
-                action_items.append(f"{', '.join(persons)}: {candidate}")
-        else:
-            # heuristics: detect patterns like "Asha will ..." via capitalized token
-            m = re.match(r'^\s*([A-Z][a-z]{1,})\b.*', s)
-            if m:
-                action_items.append(f"{m.group(1)}: {candidate}")
-            else:
-                action_items.append(f"General: {candidate}")
+    # --- Build a compact summary ---
+    important_sentences = []
+    summary_triggers = ["discuss", "meeting", "project", "goal", "topic", "decide", "plan", "overview", "agenda"]
+    for s in sentences:
+        if any(t in s.lower() for t in summary_triggers):
+            important_sentences.append(s)
+    # fallback: top N sentences
+    if not important_sentences:
+        important_sentences = sentences[:max_sentences]
+    summary = " ".join(important_sentences[:max_sentences]).strip()
 
-    # If no explicit actions found, try to extract short imperative fragments (e.g., "Please send the report")
-    if not action_items:
-        for s in sentences:
-            if re.search(r'^\s*(please|kindly|do not|do)\b', s.strip().lower()):
-                cand = re.sub(r'\s+', ' ', s).strip()
-                key = cand.lower()
-                if key not in seen_actions:
-                    seen_actions.add(key)
-                    action_items.append(f"General: {cand}")
+    # --- Create readable action list ---
+    action_items = []
+    for person, lines in person_tasks.items():
+        for l in lines:
+            clean_line = re.sub(r'[\s\n]+', ' ', l).strip()
+            action_items.append(f"{person}: {clean_line}")
 
-    # Final cleanup: if still empty, return an explicit empty list (consumer expects list)
     if not action_items:
         action_items = []
 
-    return {"summary": summary, "action_items": action_items}
+    return {
+        "summary": summary or "(no summary extracted)",
+        "action_items": action_items
+    }
 
 # ---------- FastAPI ----------
 from fastapi.middleware.cors import CORSMiddleware
