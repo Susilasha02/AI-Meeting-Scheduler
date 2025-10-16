@@ -1,3 +1,4 @@
+
 # app.py (updated to use pendulum for date parsing/timezones)
 import os
 import json
@@ -25,6 +26,9 @@ from google.auth.transport.requests import AuthorizedSession
 
 from dateutil import parser as dparse
 import pendulum
+import os
+print(">>> STARTUP app.py loaded from:", __file__, "CWD:", os.getcwd())
+
 
 load_dotenv()
 
