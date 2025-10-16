@@ -1,0 +1,84 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>AI Scheduler Debug</title>
+  <style>
+    body{font-family:Inter,system-ui,Arial;padding:18px;background:#f6f8fb}
+    textarea{width:100%;height:80px;margin-top:6px}
+    input,button{padding:8px 10px;margin:6px 0}
+    pre{background:#fff;border-radius:8px;padding:12px;border:1px solid #e6e9ef;white-space:pre-wrap}
+    .row{display:flex;gap:8px;align-items:center}
+  </style>
+</head>
+<body>
+  <h2>AI Scheduler — quick debug</h2>
+  <div>
+    <label>Prompt:</label>
+    <textarea id="prompt">30 min meeting on Saturday</textarea>
+  </div>
+  <div class="row">
+    <label>Attendees (comma separated):</label>
+    <input id="att" value="primary" />
+    <label>Duration (min):</label>
+    <input id="dur" value="30" style="width:70px"/>
+  </div>
+  <div>
+    <button id="run">Run /nlp/suggest</button>
+    <button id="dbg">GET /_debug_parser</button>
+  </div>
+
+  <h3>Result</h3>
+  <div><strong>Raw response:</strong></div>
+  <pre id="out">(not run yet)</pre>
+
+  <h3>Key fields to check</h3>
+  <ul>
+    <li><code>explicit_time</code> — whether parser thinks you asked for a concrete time</li>
+    <li><code>requested_start</code> — the exact requested start (if explicit)</li>
+    <li><code>window_start</code> / <code>window_end</code> — the search window the server will use</li>
+    <li><code>human</code> or the candidate <code>start</code> — check the day/date</li>
+  </ul>
+
+<script>
+const BASE = (location.origin || "http://localhost:3978");
+
+async function runSuggest(){
+  const prompt = document.getElementById("prompt").value;
+  const att = document.getElementById("att").value.split(",").map(x=>x.trim()).filter(Boolean);
+  const dur = parseInt(document.getElementById("dur").value||"30",10);
+  const body = {
+    prompt: prompt,
+    attendees: att.length?att:["primary"],
+    duration_min: dur
+  };
+  document.getElementById("out").textContent = "Sending...";
+  try{
+    const resp = await fetch(BASE + "/nlp/suggest", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify(body)
+    });
+    const data = await resp.json();
+    document.getElementById("out").textContent = JSON.stringify(data, null, 2);
+  }catch(e){
+    document.getElementById("out").textContent = "ERROR: " + e.toString();
+  }
+}
+
+async function runDebugParser(){
+  document.getElementById("out").textContent = "Fetching /_debug_parser ...";
+  try{
+    const resp = await fetch(BASE + "/_debug_parser");
+    const d = await resp.json();
+    document.getElementById("out").textContent = JSON.stringify(d, null, 2);
+  }catch(e){
+    document.getElementById("out").textContent = "ERROR: " + e.toString();
+  }
+}
+
+document.getElementById("run").onclick = runSuggest;
+document.getElementById("dbg").onclick = runDebugParser;
+</script>
+</body>
+</html>
