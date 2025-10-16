@@ -1,5 +1,4 @@
-
-# app.py (updated to use pendulum for date parsing/timezones)
+# app.py (patched - weekday handling fixes)
 import os
 import json
 import re
@@ -78,18 +77,6 @@ def to_rfc3339_with_tz(dt):
         # fallback: treat naive as UTC
         pd = pendulum.instance(dt).in_timezone("UTC")
     return pd.to_iso8601_string()
-
-def pretty(dt: datetime) -> str:
-    """
-    Human-friendly display in LOCAL_TZ (uses pendulum under the hood).
-    Accepts naive UTC datetimes, timezone-aware datetimes, or pendulum objects.
-    """
-    try:
-        pd = pendulum.instance(dt)
-    except Exception:
-        pd = pendulum.now("UTC")
-    local = pd.in_timezone(LOCAL_TZ)
-    return local.strftime("%a, %d %b %Y %I:%M %p") + f" ({LOCAL_TZ})"
 
 def pretty(dt: datetime) -> str:
     l = to_local(dt)
@@ -543,7 +530,10 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
         prefix = (wd.group(1) or "").lower().strip()
         weekday_name = wd.group(2).lower()
         idx = WEEKDAY_MAP[weekday_name]  # 0..6
-        today_idx = int(now_local.day_of_week)
+
+        # Use unambiguous Python weekday: Monday=0 ... Sunday=6
+        today_idx = now_local.date().weekday()
+
         base_days = (idx - today_idx) % 7
 
         if prefix == "":
@@ -628,7 +618,9 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
 
     # 6) next week
     if "next week" in plow:
-        days_until_monday = ((0 - now_local.day_of_week) % 7) or 7
+        # compute days until next Monday using unambiguous date().weekday()
+        today_idx = now_local.date().weekday()
+        days_until_monday = (0 - today_idx) % 7 or 7
         start = now_local.add(days=days_until_monday + 7).set(hour=9, minute=0, second=0)
         return _resp_from_start(start, "next_week", explicit_time=False)
 
@@ -993,20 +985,6 @@ def contacts_list():
     return load_contacts()
 
 # NL → suggest (safer wrapper)
-'''@app.post("/nlp/suggest")
-def nlp_suggest(body: dict = Body(...)):
-    try:
-        creds = load_creds(ORGANIZER_ID)
-        if not creds:
-            return JSONResponse({"error": "not_connected"}, status_code=401)
-        prompt = body.get("prompt","").strip()
-        contacts_map = load_contacts()
-        cfg = parse_prompt(prompt, contacts_map)
-        # pass the cfg dict into suggest() - it expects a body-like dict
-        return suggest(cfg)
-    except Exception as e:
-        logger.error("Exception in /nlp/suggest: %s\n%s", str(e), traceback.format_exc())
-        return JSONResponse({"error": "server_error", "detail": str(e), "trace": traceback.format_exc()}, status_code=500)'''
 @app.post("/nlp/suggest")
 def nlp_suggest(body: dict = Body(...)):
     """
@@ -1229,8 +1207,6 @@ def suggest(body: dict = Body(default={})):
         logger.exception("Exception in suggest: %s", traceback.format_exc())
         return JSONResponse({"error": "server_error", "detail": str(e), "trace": traceback.format_exc()}, status_code=500)
 
-
-
 # get_search_window_from_prompt uses pendulum and returns tz-aware start/end
 def get_search_window_from_prompt(prompt: str, days_ahead: int = 7) -> Tuple[datetime, datetime]:
     """
@@ -1272,19 +1248,22 @@ def get_search_window_from_prompt(prompt: str, days_ahead: int = 7) -> Tuple[dat
 
     # --- Handle "next week" ---
     if "next week" in p:
-        start = (now.add(days=(7 - now.day_of_week) or 7)).set(hour=9, minute=0, second=0, microsecond=0)
+        today_idx = now.date().weekday()
+        start = (now.add(days=(7 - today_idx) or 7)).set(hour=9, minute=0, second=0, microsecond=0)
         end = start.add(days=5).set(hour=18, minute=30)
         return start, end
 
     # --- Handle weekdays ("next Wednesday", "this Monday", plain "Friday") ---
     for word, idx in WEEKDAY_MAP.items():
         if f"next {word}" in p:
-            target = now.add(days=((idx - now.day_of_week) % 7) + 7)
+            today_idx = now.date().weekday()
+            target = now.add(days=((idx - today_idx) % 7) + 7)
             start = target.set(hour=9, minute=0, second=0, microsecond=0)
             end = target.set(hour=18, minute=30, second=0, microsecond=0)
             return start, end
         if f"this {word}" in p:
-            target = now.add(days=(idx - now.day_of_week) % 7)
+            today_idx = now.date().weekday()
+            target = now.add(days=(idx - today_idx) % 7)
             start = target.set(hour=9, minute=0, second=0, microsecond=0)
             end = target.set(hour=18, minute=30, second=0, microsecond=0)
             if start <= now:
@@ -1294,7 +1273,8 @@ def get_search_window_from_prompt(prompt: str, days_ahead: int = 7) -> Tuple[dat
             return start, end
         # plain weekday mention (e.g., "Wednesday") → nearest future weekday
         if re.search(rf"\b{word}\b", p):
-            days_ahead_calc = (idx - now.day_of_week) % 7
+            today_idx = now.date().weekday()
+            days_ahead_calc = (idx - today_idx) % 7
             if days_ahead_calc == 0:
                 days_ahead_calc = 7
             target = now.add(days=days_ahead_calc)
