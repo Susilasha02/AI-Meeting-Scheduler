@@ -300,44 +300,67 @@ def _next_weekday_after(base_date: datetime, weekday_index: int, at_least_one_we
         days_ahead += 7
     return base_date + timedelta(days=days_ahead)
 
+def parse_time_token(time_text: str, tz):
+    """
+    Parse a short time token like '2pm', '14:30', '2:15 pm' and return (hour, minute).
+    Deterministic manual parse first; fallback to pendulum.parse for edge cases.
+    """
+    time_text = (time_text or "").strip()
+    # manual regex parse
+    m = re.match(r"^\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*$", time_text, re.I)
+    if m:
+        hour = int(m.group(1))
+        minute = int(m.group(2) or 0)
+        mer = (m.group(3) or "").lower()
+        if mer == "pm" and hour < 12:
+            hour += 12
+        if mer == "am" and hour == 12:
+            hour = 0
+        if 0 <= hour < 24 and 0 <= minute < 60:
+            return hour, minute
+    # fallback to pendulum's parser (less strict)
+    try:
+        p = pendulum.parse(time_text, strict=False)
+        return p.hour, p.minute
+    except Exception:
+        return None, None
+
 def _apply_time_preferences(dt_date: datetime, prompt: str, local_tz: zoneinfo.ZoneInfo):
     """
-    Given a date (may have 0:00 time), pick an appropriate time:
-      - if explicit time present in prompt (e.g., '3pm') -> use parsed time
-      - if contains 'morning' -> 09:00, 'afternoon' -> 14:00, 'evening' -> 18:00
-      - otherwise default to 09:00
-    Returns an aware datetime in local tz.
+    Given a date (may have 0:00 time), pick an appropriate time and return
+    A *pendulum.DateTime* (tz-aware).
+    - explicit time tokens (11am, 2:30pm) -> used
+    - morning->09:00, afternoon->14:00, evening/night->18:00
+    - default 09:00
     """
     p = (prompt or "").lower()
-    # Check explicit time tokens first
-    tm = TIME_RE.search(prompt)
-    if tm:
-        # try to parse the time token with pendulum against today's date
-        try:
-            parsed = pendulum.parse(tm.group(1))
-            return dt_date.replace(hour=parsed.hour, minute=parsed.minute, second=0, microsecond=0, tzinfo=local_tz)
-        except Exception:
-            # defensive fallback simple parse
-            m2 = re.match(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", tm.group(1), re.I)
-            if m2:
-                hour = int(m2.group(1))
-                minute = int(m2.group(2) or 0)
-                mer = (m2.group(3) or "").lower()
-                if mer == "pm" and hour < 12:
-                    hour += 12
-                if mer == "am" and hour == 12:
-                    hour = 0
-                return dt_date.replace(hour=hour, minute=minute, second=0, microsecond=0, tzinfo=local_tz)
+    tz = None
+    try:
+        tz = pendulum.timezone(LOCAL_TZ)
+    except Exception:
+        tz = pendulum.timezone("UTC")
 
+    # If dt_date is a naive datetime (from earlier code), convert to pendulum date w/ same date
+    date_pd = pendulum.datetime(dt_date.year, dt_date.month, dt_date.day, tz=tz)
+
+    tm_match = TIME_RE.search(prompt)
+    if tm_match:
+        hh, mm = parse_time_token(tm_match.group(1), tz)
+        if hh is None:
+            # fallback to 09:00
+            hh, mm = 9, 0
+        return date_pd.set(hour=hh, minute=mm, second=0, microsecond=0)
+
+    # keyword times
     if "morning" in p:
-        return dt_date.replace(hour=9, minute=0, second=0, microsecond=0, tzinfo=local_tz)
+        return date_pd.set(hour=9, minute=0, second=0)
     if "afternoon" in p:
-        return dt_date.replace(hour=14, minute=0, second=0, microsecond=0, tzinfo=local_tz)
+        return date_pd.set(hour=14, minute=0, second=0)
     if "evening" in p or "night" in p:
-        return dt_date.replace(hour=18, minute=0, second=0, microsecond=0, tzinfo=local_tz)
+        return date_pd.set(hour=18, minute=0, second=0)
 
     # default
-    return dt_date.replace(hour=9, minute=0, second=0, microsecond=0, tzinfo=local_tz)
+    return date_pd.set(hour=9, minute=0, second=0)
 
 # ---------- Pendulum-backed parse helpers ----------
 def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_duration_min: int = 45):
@@ -382,27 +405,38 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
 
     # 1) explicit weekday/time via regex shortcuts (fast path)
     # time token present?
+    
     m_time = TIME_RE.search(p)
+    if m_time:
+        time_text = m_time.group(1)
+        # parse deterministic hour/minute
+        try:
+            tz_pd = pendulum.timezone(LOCAL_TZ)
+        except Exception:
+            tz_pd = pendulum.timezone("UTC")
 
-    # handle "next <weekday>"
-    m_next = NEXT_WEEKDAY_RE.search(p)
-    if m_next:
-        weekday = m_next.group(1).lower()
-        idx = WEEKDAY_MAP[weekday]
-        days_ahead = (idx - now_local.day_of_week) % 7
-        if days_ahead == 0:
-            days_ahead = 7
-        days_ahead += 7  # next-week
-        date = now_local.add(days=days_ahead)
-        # apply time preferences
-        start_local_dt = _apply_time_preferences(datetime(date.year, date.month, date.day), p, zoneinfo.ZoneInfo(LOCAL_TZ))
-        start_local = pendulum.instance(start_local_dt, tz)
-        if start_local <= now_local:
-            start_local = start_local.add(days=7)
+        hour, minute = parse_time_token(time_text, tz_pd)
+        if hour is None:
+            hour, minute = 9, 0
+
+        # choose date: if user said 'tomorrow', that wins; if 'next <weekday>' handled earlier
+        if "tomorrow" in plow:
+            candidate = pendulum.now(tz_pd).add(days=1).set(hour=hour, minute=minute, second=0, microsecond=0)
+        else:
+            candidate = pendulum.now(tz_pd).set(hour=hour, minute=minute, second=0, microsecond=0)
+        # if time already passed today, move to next day for user intent
+            if candidate <= pendulum.now(tz_pd):
+                candidate = candidate.add(days=1)
+
+        start_local = candidate
         start_utc = start_local.in_timezone("UTC").naive()
         end_utc = (start_local.add(minutes=duration_min)).in_timezone("UTC").naive()
-        return {"attendees": sorted(attendees) if attendees else ["primary"], "duration_min": duration_min, "window_start": rfc3339(start_utc), "window_end": rfc3339(end_utc)}
-
+        return {
+            "attendees": sorted(attendees) if attendees else ["primary"],
+            "duration_min": duration_min,
+            "window_start": rfc3339(start_utc),
+            "window_end": rfc3339(end_utc)
+        }
     # handle "this <weekday>"
     m_this = THIS_WEEKDAY_RE.search(p)
     if m_this:
@@ -579,56 +613,85 @@ def _shorten_action(s: str, maxlen: int = 180) -> str:
 
 def _spacy_extract_actions(sent: str):
     """
-    Use spaCy dependency parse to extract (subject, verb phrase / object) pairs.
-    Returns list of (subject_or_None, action_text).
+    Use spaCy dependency parse to extract (subject, action) pairs.
+    Better attempts to recover subjects when casing/punctuation is poor.
     """
     if not _nlp:
         return []
+    # If text is all-lower, give spaCy a capitalized variant for better entity recognition,
+    # but keep original for subtree extraction.
+    doc_input = sent
+    needs_title = sent.strip() and sent.strip() == sent.strip().lower()
+    if needs_title:
+        doc_for_ents = _nlp(sent.title())
+    else:
+        doc_for_ents = _nlp(sent)
     doc = _nlp(sent)
+
     actions = []
-    # find tokens that are main verbs (ROOT or VERB) and extract their subject and object/clause
     for tok in doc:
         if tok.pos_ == "VERB" or tok.dep_ == "ROOT":
-            # find subject
             subj = None
+            # find subject token in dependency tree
             for ch in tok.children:
                 if ch.dep_.startswith("nsubj"):
                     subj = ch.text
-                    # prefer proper name if available in subtree
-                    for ent in doc.ents:
-                        if ent.start <= ch.i <= ent.end:
+                    # try to see if spaCy produced an entity covering this subject in doc_for_ents
+                    for ent in doc_for_ents.ents:
+                        # ent start/end are indices inside doc_for_ents. Map by text compare fallback.
+                        if ent.text.lower().find(ch.text.lower()) != -1:
                             subj = ent.text
                             break
                     break
-            # build a short action phrase: verb + direct object + relevant subtree
-            parts = [tok.lemma_]
-            # include direct objects and their compounds/objects
+            # assemble action phrase
             dobj_parts = []
             for ch in tok.children:
                 if ch.dep_.endswith("obj") or ch.dep_ in ("dobj", "pobj", "attr"):
                     dobj_parts.append(" ".join([t.text for t in ch.subtree]))
-            # if no direct object, include the verb's subtree minus subject
             if dobj_parts:
-                action_text = tok.text + " " + ", ".join(dobj_parts)
+                action_text = tok.lemma_ + " " + ", ".join(dobj_parts)
             else:
-                # include verb + a short slice of subtree (avoid entire sentence)
-                subtree_words = [t.text for t in tok.subtree if t.i >= tok.i][:10]
+                subtree_words = [t.text for t in tok.subtree if t.i >= tok.i][:12]
                 action_text = " ".join(subtree_words)
             action_text = _shorten_action(action_text)
             actions.append((subj, action_text))
     return actions
 
 def _legacy_extract_person_action(s: str):
-    """Keep fallback legacy extractor (your original rules) for safety."""
+    """
+    Heuristic fallback:
+    - Accept lowercase names like 'john will ...' (case-insensitive)
+    - Patterns:
+        'john will ...'
+        'please john: ...'
+        'john, please ...'
+    - If no person found but action triggers exist, return general action.
+    """
     s_norm = s.strip()
-    m = re.search(r"\b([A-Z][a-z]{1,30})\b\s+(?:will|shall|should|is to|is going to|please|must|needs to)\b", s)
+    if not s_norm:
+        return None, None
+
+    # 1) 'Please xyz: do X' or 'please xyz, do X'
+    m = re.search(r"(?:please\s+)?\b([A-Za-z][a-z]{0,30})\b[:\,]?\s+(.*)", s_norm, re.I)
     if m:
-        name = m.group(1)
-        rest = s[m.end():].strip()
+        candidate_name = m.group(1).strip()
+        rest = m.group(2).strip()
+        # require that rest contains an action trigger
+        if re.search(r"\b(" + "|".join([re.escape(tok) for tok in _ACTION_TRIGGERS]) + r")\b", rest, re.I):
+            return candidate_name.title(), _shorten_action(rest)
+
+    # 2) 'xyz will ...' or 'xyz will ...' pattern
+    m2 = re.search(r"\b([A-Za-z][a-z]{0,30})\b\s+(?:will|shall|should|is to|is going to|needs to|need to|please|must|should)\b\s*(.*)", s_norm, re.I)
+    if m2:
+        name = m2.group(1).strip()
+        rest = m2.group(2).strip()
         if rest:
-            return name, _shorten_action(rest)
-    if any(re.search(rf"\b{re.escape(tok)}\b", s_norm, re.I) for tok in _ACTION_TRIGGERS):
+            return name.title(), _shorten_action(rest)
+
+    # 3) If not name-specific, look for any action-trigger in sentence -> general action
+    if re.search(r"\b(" + "|".join([re.escape(tok) for tok in _ACTION_TRIGGERS]) + r")\b", s_norm, re.I):
         return None, _shorten_action(s_norm)
+
     return None, None
 
 def summarize_transcript(transcript: str, max_sentences: int = 6):
