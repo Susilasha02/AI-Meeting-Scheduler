@@ -1117,6 +1117,16 @@ def suggest(body: dict = Body(default={})):
                     attendees, start.to_iso8601_string(), end.to_iso8601_string(), prompt_text, explicit_flag, requested_start_iso)
         logger.info("FINAL search window (local): %s → %s", start.to_iso8601_string(), end.to_iso8601_string())
 
+        # --- SAFETY PATCH: auto-expand short windows so scheduler can always generate slots ---
+        window_minutes = (end - start).total_minutes() if hasattr(end, 'total_minutes') else (end - start).total_seconds() / 60.0
+        if window_minutes < 180:
+            # if window shorter than 3 hours
+            old_end = end
+            end = start.add(hours=4)
+            logger.info("Auto-expanded short window from %s to %s (was %.1f min)", old_end.to_iso8601_string(), end.to_iso8601_string(), window_minutes)
+# --- END PATCH ---
+
+
         # ---------------- freebusy call ----------------
         fb = freebusy(creds, attendees, start_iso_for_api, end_iso_for_api)
         logger.info("RAW freebusy: %s", json.dumps(fb))
@@ -1135,29 +1145,76 @@ def suggest(body: dict = Body(default={})):
         raw_candidates = candidates(free, duration_min=duration_min, buffer_min=buffer_min)
 
         # ---------------- strict filtering when explicit requested time present ----------------
+                # ---------------- strict filtering when explicit requested time present ----------------
         cands = []
         now_utc = pendulum.now("UTC")
         effective_start = start_pd_utc if start_pd_utc > now_utc else now_utc
 
         if explicit_flag and requested_start_iso:
-            # strict window width in hours around requested start (configurable)
-            strict_hours = float(body.get("strict_window_hours", 2.0))
+            # progressive relaxation strategy
             try:
                 req_pd_local = pendulum.parse(requested_start_iso)
-                # convert requested start to UTC for comparison with candidate starts (which are RFC ISO often in UTC)
                 req_pd_utc = req_pd_local.in_timezone("UTC")
-                strict_start_utc = req_pd_utc  # start at requested_start (can be adjusted to req_pd_utc - delta)
-                strict_end_utc = req_pd_utc.add(hours=strict_hours)
 
+                # 1) try tight strict window (requested_start -> +strict_hours)
+                strict_hours = float(body.get("strict_window_hours", 2.0))
+                strict_start_utc = req_pd_utc
+                strict_end_utc = req_pd_utc.add(hours=strict_hours)
                 logger.info("suggest: strict filtering active. requested_start(utc)=%s strict_end(utc)=%s", strict_start_utc.to_iso8601_string(), strict_end_utc.to_iso8601_string())
 
-                # primary filter: candidates inside strict window
                 cands = [c for c in raw_candidates if (pendulum.parse(c["start"]) >= strict_start_utc and pendulum.parse(c["start"]) <= strict_end_utc)]
 
-                # fallback 1: if none found, allow candidates >= requested_start
+                # 2) Relax 1 — widen the strict window up to a max (configurable)
+                if not cands:
+                    max_relax_hours = float(body.get("max_relax_hours", 12.0))
+                    widen_hours = min(max_relax_hours, max(4.0, strict_hours * 3))
+                    wide_start = req_pd_utc.subtract(hours=widen_hours/2)
+                    wide_end = req_pd_utc.add(hours=widen_hours/2)
+                    logger.info("suggest: widening strict window to %s - %s (hours=%s)", wide_start.to_iso8601_string(), wide_end.to_iso8601_string(), widen_hours)
+                    cands = [c for c in raw_candidates if (pendulum.parse(c["start"]) >= wide_start and pendulum.parse(c["start"]) <= wide_end)]
+
+                # 3) Relax 2 — any candidate at or after requested_start
                 if not cands:
                     logger.info("suggest: strict window returned no candidates; relaxing to candidates >= requested_start")
                     cands = [c for c in raw_candidates if pendulum.parse(c["start"]) >= req_pd_utc]
+
+                # 4) Relax 3 — expand to the whole working day of the requested date (local 09:00-18:30)
+                if not cands:
+                    try:
+                        local_req = req_pd_local.in_timezone(LOCAL_TZ)
+                        day_start = local_req.set(hour=9, minute=0, second=0, microsecond=0)
+                        day_end = local_req.set(hour=18, minute=30, second=0, microsecond=0)
+                        day_start_utc = day_start.in_timezone("UTC")
+                        day_end_utc = day_end.in_timezone("UTC")
+                        logger.info("suggest: relaxing to full working day window %s -> %s", day_start_utc.to_iso8601_string(), day_end_utc.to_iso8601_string())
+                        cands = [c for c in raw_candidates if (pendulum.parse(c["start"]) >= day_start_utc and pendulum.parse(c["start"]) <= day_end_utc)]
+                    except Exception:
+                        logger.exception("suggest: failed to expand to working day window")
+
+                # 5) Relax 4 — if still none and freebusy shows calendars completely free, generate fallback synthetic slots across the day
+                if not cands:
+                    all_free = all(len(v) == 0 for v in fb.values())
+                    if all_free:
+                        # create synthetic candidates across the requested date (local) to show the user options
+                        synthetic = []
+                        try:
+                            local_mid = req_pd_local.in_timezone(LOCAL_TZ).set(hour=9, minute=0, second=0, microsecond=0)
+                            end_local_day = local_mid.set(hour=18, minute=0)
+                            cur = local_mid
+                            step = timedelta(minutes=30)
+                            dur = timedelta(minutes=duration_min)
+                            while cur + dur <= end_local_day:
+                                synthetic.append({
+                                    "start": cur.to_iso8601_string(),
+                                    "end": (cur + dur).to_iso8601_string(),
+                                    "meta": {"buffers": {"pre": buffer_min, "post": buffer_min}}
+                                })
+                                cur = cur + step
+                        except Exception:
+                            synthetic = []
+                        if synthetic:
+                            logger.info("suggest: returning %d synthetic candidates because calendars are empty", len(synthetic))
+                            cands = synthetic
 
             except Exception:
                 logger.exception("suggest: failed strict requested_start parsing; falling back to standard behavior")
@@ -1166,7 +1223,7 @@ def suggest(body: dict = Body(default={})):
             # normal behaviour: proposals start at or after the requested start (start_pd_utc)
             cands = [c for c in raw_candidates if pendulum.parse(c["start"]) >= start_pd_utc]
 
-        # If no candidates after filtering, relax progressively
+        # If no candidates after filtering, relax progressively to effective_start and then to raw candidates
         if not cands:
             logger.info("suggest: no candidates after requested filtering; relaxing to effective_start >= now or window start")
             cands = [c for c in raw_candidates if pendulum.parse(c["start"]) >= effective_start]
@@ -1174,6 +1231,7 @@ def suggest(body: dict = Body(default={})):
         if not cands:
             logger.info("suggest: still none after relax; returning raw candidates (last resort)")
             cands = raw_candidates
+
 
         # ---------------- scoring & response ----------------
         scored = []
