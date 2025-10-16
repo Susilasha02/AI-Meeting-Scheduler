@@ -915,27 +915,24 @@ def suggest(body: dict = Body(default={})):
             attendees = ["primary"]
 
         # compute window: either explicit window OR derived from prompt + today_only
-                # compute window: either explicit window OR derived from prompt + today_only
         start_iso = body.get("window_start")
         end_iso   = body.get("window_end")
         prompt_text = body.get("prompt", "")
         today_only_flag = bool(body.get("today_only", False))
 
+        # Use pendulum for robust tz-aware parsing
         if start_iso and end_iso:
-            # Parse RFC3339 (offset-aware) using pendulum to preserve tz
             start_pd = pendulum.parse(start_iso)
             end_pd = pendulum.parse(end_iso)
-            # Keep pendulum objects (timezone-aware). We'll convert to UTC strings for freebusy.
             start = start_pd
             end = end_pd
         else:
             if prompt_text:
-                # produce a local window (already returns offset-aware ISO strings)
                 if today_only_flag:
                     start_dt, end_dt = get_search_window_from_prompt(prompt_text, days_ahead=0)
                 else:
                     start_dt, end_dt = get_search_window_from_prompt(prompt_text, days_ahead=7)
-                # get_search_window_from_prompt returns tz-aware datetimes — ensure pendulum instances
+                # ensure pendulum instances (tz-aware)
                 start = pendulum.instance(start_dt)
                 end = pendulum.instance(end_dt)
             else:
@@ -947,26 +944,38 @@ def suggest(body: dict = Body(default={})):
         start_iso_for_api = to_rfc3339_with_tz(pendulum.instance(start).in_timezone("UTC"))
         end_iso_for_api = to_rfc3339_with_tz(pendulum.instance(end).in_timezone("UTC"))
 
-        # call freebusy (it expects RFC3339 strings). freebusy returns busy intervals with offsets.
+        logger.info("suggest: attendees=%s start=%s end=%s prompt=%s",
+                    attendees, start_iso_for_api, end_iso_for_api, prompt_text)
+
+        # call freebusy (it expects RFC3339 strings)
         fb = freebusy(creds, attendees, start_iso_for_api, end_iso_for_api)
 
-        # Convert busy results into lists used by compute_free
+        # busy_lists: keep the raw ISO strings returned by Google (they include offsets)
         busy_lists = [[{"start": b["start"], "end": b["end"]} for b in fb[cal]] for cal in fb]
 
-        # For compute_free we will use timezone-aware UTC pendulum datetimes
-        # compute_free expects datetime objects; pendulum instances are accepted
-        start_pd_utc = pendulum.parse(start_iso_for_api)
+        # convert start/end to pendulum UTC datetimes for internal computations
+        start_pd_utc = pendulum.parse(start_iso_for_api)   # tz-aware (UTC)
         end_pd_utc = pendulum.parse(end_iso_for_api)
 
+        # compute free windows (compute_free accepts datetime-like objects)
         free = compute_free(busy_lists, start_pd_utc, end_pd_utc)
 
+        # generate candidate slots
+        raw_candidates = candidates(free, duration_min=duration_min, buffer_min=buffer_min)
 
-        # call freebusy
-        fb = freebusy(creds, attendees, rfc3339(start), rfc3339(end))
+        # Anchor: only propose slots that start at-or-after the requested start time
+        now_utc = pendulum.now("UTC")
+        effective_start = start_pd_utc if start_pd_utc > now_utc else now_utc
 
-        busy_lists = [[{"start":b["start"], "end":b["end"]} for b in fb[cal]] for cal in fb]
-        free = compute_free(busy_lists, start, end)
-        cands = candidates(free, duration_min=duration_min, buffer_min=buffer_min)
+        # filter raw_candidates so they are >= requested start (use pendulum.parse for safety)
+        cands = [c for c in raw_candidates if pendulum.parse(c["start"]) >= start_pd_utc]
+
+        # If filtering removed all candidates, fall back to raw (so user still sees options)
+        if not cands:
+            # Try relaxing: allow candidates after effective_start (now)
+            cands = [c for c in raw_candidates if pendulum.parse(c["start"]) >= effective_start]
+        if not cands:
+            cands = raw_candidates  # last-resort fallback
 
         # fairness-aware scoring
         scored = []
@@ -977,8 +986,8 @@ def suggest(body: dict = Body(default={})):
         top = sorted(scored, key=lambda x: x[0], reverse=True)[:3]
         resp=[]
         for score, comp, sl in top:
-            start_dt = datetime.fromisoformat(sl["start"])
-            end_dt   = datetime.fromisoformat(sl["end"])
+            start_dt = pendulum.parse(sl["start"])
+            end_dt   = pendulum.parse(sl["end"])
             why = explain(sl)
             why.update({"fairness": {
                 "midday_closeness": comp["midday_closeness"],
@@ -1002,7 +1011,9 @@ def suggest(body: dict = Body(default={})):
             detail = str(he)
         return JSONResponse({"error": "google_api_error", "detail": detail}, status_code=500)
     except Exception as e:
+        logger.exception("Exception in suggest: %s", traceback.format_exc())
         return JSONResponse({"error": "server_error", "detail": str(e), "trace": traceback.format_exc()}, status_code=500)
+
 
 # get_search_window_from_prompt uses pendulum and returns tz-aware start/end
 def get_search_window_from_prompt(prompt: str, days_ahead: int = 7) -> Tuple[datetime, datetime]:
