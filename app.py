@@ -1144,96 +1144,141 @@ def suggest(body: dict = Body(default={})):
         # generate candidate slots
         raw_candidates = candidates(free, duration_min=duration_min, buffer_min=buffer_min)
 
-        # ---------------- strict filtering when explicit requested time present ----------------
-                # ---------------- strict filtering when explicit requested time present ----------------
+        # ---------- STRICT/PROGRESSIVE WINDOW (consistent tz) ----------
         cands = []
         now_utc = pendulum.now("UTC")
         effective_start = start_pd_utc if start_pd_utc > now_utc else now_utc
 
         if explicit_flag and requested_start_iso:
-            # progressive relaxation strategy
             try:
-                req_pd_local = pendulum.parse(requested_start_iso)
-                req_pd_utc = req_pd_local.in_timezone("UTC")
+                # parse requested start as local tz explicitly (single source of truth)
+                req_local = pendulum.parse(requested_start_iso).in_timezone(LOCAL_TZ)
 
-                # 1) try tight strict window (requested_start -> +strict_hours)
+                # --- requested_start guard: if exact requested time is available, insert it as top candidate ---
+                try:
+                    req_utc = req_local.in_timezone("UTC")
+                    req_end_utc = req_utc.add(minutes=duration_min)
+
+                    def overlaps_busy(start_utc, end_utc):
+                        for evs in fb.values():
+                            for ev in evs:
+                                try:
+                                    busy_s = pendulum.parse(ev["start"]).in_timezone("UTC")
+                                    busy_e = pendulum.parse(ev["end"]).in_timezone("UTC")
+                                    if not (end_utc <= busy_s or start_utc >= busy_e):
+                                        return True
+                                except Exception:
+                                    continue
+                        return False
+
+                    # include pre/post buffer when checking availability
+                    start_with_buffer = req_utc.subtract(minutes=buffer_min)
+                    end_with_buffer = req_end_utc.add(minutes=buffer_min)
+
+                    if not overlaps_busy(start_with_buffer, end_with_buffer):
+                        requested_candidate = {
+                            "slot": {
+                                "start": req_utc.to_iso8601_string(),
+                                "end": req_end_utc.to_iso8601_string(),
+                                "meta": {"buffers": {"pre": buffer_min, "post": buffer_min}}
+                            },
+                            "start": req_utc.to_iso8601_string(),
+                            "end": req_end_utc.to_iso8601_string(),
+                            "human": f"{req_local.format('ddd, DD MMM YYYY hh:mm A')} → {req_local.add(minutes=duration_min).format('hh:mm A')} ({LOCAL_TZ})",
+                            "explain": {"conflict_free": True, "reason": "requested_start_available"},
+                            "score": 1.0
+                        }
+
+                        # avoid duplicate if same UTC start already exists
+                        existing_start_times = {c["start"] for c in raw_candidates}
+                        if req_utc.to_iso8601_string() not in existing_start_times:
+                            raw_candidates.insert(0, requested_candidate)
+                            logger.info("suggest: requested_start %s is free — inserted as top candidate", req_utc.to_iso8601_string())
+                except Exception:
+                    logger.exception("suggest: requested_start availability check failed (non-fatal)")
+                # --- end requested_start guard ---
+
+                # build strict local window (requested_start -> +strict_hours)
                 strict_hours = float(body.get("strict_window_hours", 2.0))
-                strict_start_utc = req_pd_utc
-                strict_end_utc = req_pd_utc.add(hours=strict_hours)
-                logger.info("suggest: strict filtering active. requested_start(utc)=%s strict_end(utc)=%s", strict_start_utc.to_iso8601_string(), strict_end_utc.to_iso8601_string())
+                strict_start_local = req_local
+                strict_end_local = req_local.add(hours=strict_hours)
 
+                # convert to UTC for comparison with raw candidate starts (raw_candidates use UTC)
+                strict_start_utc = strict_start_local.in_timezone("UTC")
+                strict_end_utc = strict_end_local.in_timezone("UTC")
+
+                logger.info("suggest: strict filtering (local) %s -> %s ; (utc) %s -> %s",
+                            strict_start_local.to_iso8601_string(), strict_end_local.to_iso8601_string(),
+                            strict_start_utc.to_iso8601_string(), strict_end_utc.to_iso8601_string())
+
+                # 1) prefer candidates within strict (closest to requested start)
                 cands = [c for c in raw_candidates if (pendulum.parse(c["start"]) >= strict_start_utc and pendulum.parse(c["start"]) <= strict_end_utc)]
 
-                # 2) Relax 1 — widen the strict window up to a max (configurable)
+                # 2) Relax: prefer candidates >= requested_start (forward only)
+                if not cands:
+                    cands = [c for c in raw_candidates if pendulum.parse(c["start"]) >= strict_start_utc]
+                    logger.info("suggest: relaxing to candidates >= strict_start_utc -> found %d", len(cands))
+
+                # 3) Widen window symmetrically around requested start (max_relax_hours limit)
                 if not cands:
                     max_relax_hours = float(body.get("max_relax_hours", 12.0))
                     widen_hours = min(max_relax_hours, max(4.0, strict_hours * 3))
-                    wide_start = req_pd_utc.subtract(hours=widen_hours/2)
-                    wide_end = req_pd_utc.add(hours=widen_hours/2)
-                    logger.info("suggest: widening strict window to %s - %s (hours=%s)", wide_start.to_iso8601_string(), wide_end.to_iso8601_string(), widen_hours)
-                    cands = [c for c in raw_candidates if (pendulum.parse(c["start"]) >= wide_start and pendulum.parse(c["start"]) <= wide_end)]
+                    wide_start_local = req_local.subtract(hours=widen_hours/2)
+                    wide_end_local = req_local.add(hours=widen_hours/2)
+                    wide_start_utc = wide_start_local.in_timezone("UTC")
+                    wide_end_utc = wide_end_local.in_timezone("UTC")
+                    cands = [c for c in raw_candidates if (pendulum.parse(c["start"]) >= wide_start_utc and pendulum.parse(c["start"]) <= wide_end_utc)]
+                    logger.info("suggest: widened window (local) %s->%s (utc) %s->%s found=%d",
+                                wide_start_local.to_iso8601_string(), wide_end_local.to_iso8601_string(),
+                                wide_start_utc.to_iso8601_string(), wide_end_utc.to_iso8601_string(), len(cands))
 
-                # 3) Relax 2 — any candidate at or after requested_start
+                # 4) Expand to full working day (local) of requested date
                 if not cands:
-                    logger.info("suggest: strict window returned no candidates; relaxing to candidates >= requested_start")
-                    cands = [c for c in raw_candidates if pendulum.parse(c["start"]) >= req_pd_utc]
+                    day_start_local = req_local.set(hour=9, minute=0, second=0, microsecond=0)
+                    day_end_local = req_local.set(hour=18, minute=30, second=0, microsecond=0)
+                    day_start_utc = day_start_local.in_timezone("UTC")
+                    day_end_utc = day_end_local.in_timezone("UTC")
+                    cands = [c for c in raw_candidates if (pendulum.parse(c["start"]) >= day_start_utc and pendulum.parse(c["start"]) <= day_end_utc)]
+                    logger.info("suggest: expanded to working day (local) %s->%s found=%d",
+                                day_start_local.to_iso8601_string(), day_end_local.to_iso8601_string(), len(cands))
 
-                # 4) Relax 3 — expand to the whole working day of the requested date (local 09:00-18:30)
-                if not cands:
-                    try:
-                        local_req = req_pd_local.in_timezone(LOCAL_TZ)
-                        day_start = local_req.set(hour=9, minute=0, second=0, microsecond=0)
-                        day_end = local_req.set(hour=18, minute=30, second=0, microsecond=0)
-                        day_start_utc = day_start.in_timezone("UTC")
-                        day_end_utc = day_end.in_timezone("UTC")
-                        logger.info("suggest: relaxing to full working day window %s -> %s", day_start_utc.to_iso8601_string(), day_end_utc.to_iso8601_string())
-                        cands = [c for c in raw_candidates if (pendulum.parse(c["start"]) >= day_start_utc and pendulum.parse(c["start"]) <= day_end_utc)]
-                    except Exception:
-                        logger.exception("suggest: failed to expand to working day window")
-
-                # 5) Relax 4 — if still none and freebusy shows calendars completely free, generate fallback synthetic slots across the day
+                # 5) If calendars empty and still none, generate synthetic forward-only candidates on requested date (local)
                 if not cands:
                     all_free = all(len(v) == 0 for v in fb.values())
                     if all_free:
-                        # create synthetic candidates across the requested date (local) to show the user options
                         synthetic = []
-                        try:
-                            local_mid = req_pd_local.in_timezone(LOCAL_TZ).set(hour=9, minute=0, second=0, microsecond=0)
-                            end_local_day = local_mid.set(hour=18, minute=0)
-                            cur = local_mid
-                            step = timedelta(minutes=30)
-                            dur = timedelta(minutes=duration_min)
-                            while cur + dur <= end_local_day:
+                        cur_local = req_local.set(hour=9, minute=0, second=0)
+                        end_local_day = req_local.set(hour=18, minute=0, second=0)
+                        step = timedelta(minutes=30)
+                        dur = timedelta(minutes=duration_min)
+                        while cur_local + dur <= end_local_day:
+                            # only include synthetic slots at or after requested_start (forward-only)
+                            if cur_local >= req_local.start_of("minute"):
                                 synthetic.append({
-                                    "start": cur.to_iso8601_string(),
-                                    "end": (cur + dur).to_iso8601_string(),
+                                    "start": cur_local.in_timezone("UTC").to_iso8601_string(),
+                                    "end": cur_local.add(minutes=duration_min).in_timezone("UTC").to_iso8601_string(),
                                     "meta": {"buffers": {"pre": buffer_min, "post": buffer_min}}
                                 })
-                                cur = cur + step
-                        except Exception:
-                            synthetic = []
+                            cur_local = cur_local + step
                         if synthetic:
-                            logger.info("suggest: returning %d synthetic candidates because calendars are empty", len(synthetic))
+                            logger.info("suggest: returning %d synthetic candidates (forward-only) because calendars are empty", len(synthetic))
                             cands = synthetic
 
             except Exception:
-                logger.exception("suggest: failed strict requested_start parsing; falling back to standard behavior")
+                logger.exception("suggest: strict requested_start handling failed; falling back")
                 cands = [c for c in raw_candidates if pendulum.parse(c["start"]) >= start_pd_utc]
+
         else:
-            # normal behaviour: proposals start at or after the requested start (start_pd_utc)
+            # non-explicit path: normal proposals >= window start
             cands = [c for c in raw_candidates if pendulum.parse(c["start"]) >= start_pd_utc]
 
-        # If no candidates after filtering, relax progressively to effective_start and then to raw candidates
+        # final progressive fallback (as before)
         if not cands:
-            logger.info("suggest: no candidates after requested filtering; relaxing to effective_start >= now or window start")
             cands = [c for c in raw_candidates if pendulum.parse(c["start"]) >= effective_start]
-
         if not cands:
-            logger.info("suggest: still none after relax; returning raw candidates (last resort)")
             cands = raw_candidates
 
-
-        # ---------------- scoring & response ----------------
+       # ---------------- scoring & response ----------------
         scored = []
         for sl in cands:
             score, comp = _fairness_score(sl, fb)
