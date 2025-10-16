@@ -1277,8 +1277,61 @@ def suggest(body: dict = Body(default={})):
                 cands = [c for c in raw_candidates if pendulum.parse(c["start"]) >= start_pd_utc]
 
         else:
-            # non-explicit path: normal proposals >= window start
+
+            # ---------- NON-EXPLICIT (day-only) PROMPTS ----------
+            # normal proposals >= window start
             cands = [c for c in raw_candidates if pendulum.parse(c["start"]) >= start_pd_utc]
+
+            # If window too short, expand to full working day
+            window_minutes = (end - start).total_seconds() / 60.0
+            if window_minutes < 120:
+                old_end = end
+                end = start.add(hours=4)
+                logger.info("Auto-expanded short non-explicit window from %s to %s (was %.1f min)",
+                            old_end.to_iso8601_string(), end.to_iso8601_string(), window_minutes)
+
+            # ---------- Synthetic slot generator if calendars are empty ----------
+            if not cands:
+                try:
+                    all_free = all(len(v) == 0 for v in fb.values())
+                    if all_free:
+                        start_local = start_pd_utc.in_timezone(LOCAL_TZ)
+                        day_start_local = start_local.set(hour=9, minute=0, second=0, microsecond=0)
+                        day_end_local = start_local.set(hour=18, minute=0, second=0, microsecond=0)
+
+                        synthetic = []
+                        cur_local = day_start_local
+                        step = timedelta(minutes=30)       # distance between generated slots
+                        dur = timedelta(minutes=duration_min)
+
+                        while cur_local + dur <= day_end_local:
+                            synthetic.append({
+                                "slot": {
+                                    "start": cur_local.in_timezone("UTC").to_iso8601_string(),
+                                    "end": cur_local.add(minutes=duration_min).in_timezone("UTC").to_iso8601_string(),
+                                    "meta": {"buffers": {"pre": buffer_min, "post": buffer_min}}
+                                },
+                                "start": cur_local.in_timezone("UTC").to_iso8601_string(),
+                                "end": cur_local.add(minutes=duration_min).in_timezone("UTC").to_iso8601_string(),
+                                "meta": {"buffers": {"pre": buffer_min, "post": buffer_min}},
+                                "human": f"{cur_local.format('ddd, DD MMM YYYY hh:mm A')} → {cur_local.add(minutes=duration_min).format('hh:mm A')} ({LOCAL_TZ})",
+                                "explain": {"conflict_free": True, "reason": "synthetic_day_slot"},
+                                "score": 0.5
+                            })
+                            cur_local = cur_local + step
+
+                        if synthetic:
+                            logger.info("suggest: non-explicit path — returning %d synthetic candidates (calendar empty)",
+                                        len(synthetic))
+                            cands = synthetic
+                except Exception:
+                    logger.exception("suggest: failed synthetic generation for non-explicit path")
+
+            # ---------- Show at most N top slots (so UI displays several) ----------
+            # sort by score or start time; keep top 3
+            if cands:
+                cands = sorted(cands, key=lambda x: pendulum.parse(x["start"]))[:3]
+
 
         # final progressive fallback (as before)
         if not cands:
