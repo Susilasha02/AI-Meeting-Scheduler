@@ -1179,13 +1179,20 @@ def get_search_window_from_prompt(prompt: str, days_ahead: int = 7) -> Tuple[dat
         tz = zoneinfo.ZoneInfo(LOCAL_TZ)
     except Exception:
         tz = zoneinfo.ZoneInfo("UTC")
+
     now = datetime.now(tz)
     p = (prompt or "").lower().strip()
 
     # --- Handle simple relative words ---
     if "today" in p:
+        # if it's late already, allow next-day fallback by UI logic; here keep today's work hours
         start = now.replace(hour=9, minute=0, second=0, microsecond=0)
         end = now.replace(hour=18, minute=30, second=0, microsecond=0)
+        # If it's already past work hours, return tomorrow's window instead
+        if now.hour >= 18 and now.minute > 30:
+            tomorrow = now + timedelta(days=1)
+            start = tomorrow.replace(hour=9, minute=0, second=0, microsecond=0)
+            end = tomorrow.replace(hour=18, minute=30, second=0, microsecond=0)
         return start, end
 
     if "tomorrow" in p:
@@ -1205,22 +1212,36 @@ def get_search_window_from_prompt(prompt: str, days_ahead: int = 7) -> Tuple[dat
 
     # --- Handle "next week" ---
     if "next week" in p:
-        start = (now + timedelta(days=(7 - now.weekday()))).replace(hour=9, minute=0, second=0, microsecond=0)
+        # start at next week's Monday-ish (preserve local tz)
+        days_to_next_week = (7 - now.weekday()) or 7
+        start = (now + timedelta(days=days_to_next_week)).replace(hour=9, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=5, hours=9, minutes=30)
         return start, end
 
     # --- Handle weekdays ("next Wednesday", "this Monday", plain "Friday") ---
     for word, idx in WEEKDAY_MAP.items():
         if f"next {word}" in p:
-            target = now + timedelta((idx - now.weekday()) % 7 + 7)
+            # go to the weekday in the next week
+            delta_days = (idx - now.weekday()) % 7
+            if delta_days == 0:
+                delta_days = 7
+            target = now + timedelta(days=delta_days + 7)
             start = target.replace(hour=9, minute=0, second=0, microsecond=0)
             end = target.replace(hour=18, minute=30, second=0, microsecond=0)
             return start, end
+
         if f"this {word}" in p:
-            target = now + timedelta((idx - now.weekday()) % 7)
+            delta_days = (idx - now.weekday()) % 7
+            target = now + timedelta(days=delta_days)
             start = target.replace(hour=9, minute=0, second=0, microsecond=0)
             end = target.replace(hour=18, minute=30, second=0, microsecond=0)
+            # if 'this X' resolves to a day earlier today, move to next week's same weekday
+            if start <= now:
+                target = _next_weekday_after(now, idx, at_least_one_week_ahead=True)
+                start = target.replace(hour=9, minute=0, second=0, microsecond=0)
+                end = target.replace(hour=18, minute=30, second=0, microsecond=0)
             return start, end
+
         # plain weekday mention (e.g., "Wednesday") → nearest future weekday
         if re.search(rf"\b{word}\b", p):
             days_ahead_calc = (idx - now.weekday()) % 7
@@ -1231,17 +1252,61 @@ def get_search_window_from_prompt(prompt: str, days_ahead: int = 7) -> Tuple[dat
             end = target.replace(hour=18, minute=30, second=0, microsecond=0)
             return start, end
 
-    # --- Handle explicit date with dateparser ---
+    # --- Handle explicit date with dateparser (tz-aware relative base + request tz-aware results) ---
     try:
-        sd = search_dates(prompt or "", settings={"PREFER_DATES_FROM": "future", "RELATIVE_BASE": datetime.utcnow()})
+        # Use a timezone-aware relative base (local tz) so dateparser resolves 'today/tonight' correctly
+        rel_base = now
+        sd = search_dates(
+            prompt or "",
+            settings={
+                "PREFER_DATES_FROM": "future",
+                "RELATIVE_BASE": rel_base,
+                "RETURN_AS_TIMEZONE_AWARE": True
+            }
+        )
         if sd:
-            dt = sd[0][1]
+            # pick the first meaningful match
+            matched_text, dt = sd[0]
+            if dt is None:
+                raise ValueError("dateparser returned None")
+            # If dateparser returned naive dt, interpret as local timezone (more intuitive)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=tz)
-            start = dt.replace(hour=9, minute=0, second=0, microsecond=0)
-            end = start.replace(hour=18, minute=30)
+            else:
+                dt = dt.astimezone(tz)
+
+            # If user included an explicit time token, keep that time; otherwise treat as date-only -> set default work hours
+            has_time_token = bool(TIME_RE.search(p))
+            if (getattr(dt, "hour", 0) == 0 and getattr(dt, "minute", 0) == 0) and not has_time_token:
+                # date-only: use full work day
+                start = dt.replace(hour=9, minute=0, second=0, microsecond=0)
+                end = dt.replace(hour=18, minute=30, second=0, microsecond=0)
+            else:
+                # parsed datetime included a time — anchor window tightly around that time (allow some range)
+                start = dt.replace(second=0, microsecond=0)
+                # provide a reasonable end (workday end or +4h cap whichever smaller)
+                tentative_end = start + timedelta(hours=4)
+                workday_end = start.replace(hour=18, minute=30, second=0, microsecond=0)
+                end = tentative_end if tentative_end <= workday_end else workday_end
+
+            # If the resulting start is in the past, adjust conservatively:
+            if start <= now:
+                # If user explicitly asked for 'tomorrow' / weekday / 'next', move forward by 1 day
+                if "tomorrow" in p or any(w in p for w in ("next ", "next", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")):
+                    start = start + timedelta(days=1)
+                    if (getattr(start, "hour", 0) == 0 and getattr(start, "minute", 0) == 0):
+                        start = start.replace(hour=9, minute=0, second=0, microsecond=0)
+                    end = start.replace(hour=18, minute=30, second=0, microsecond=0)
+                else:
+                    # ambiguous case — pick a near-future time instead of jumping a whole day
+                    start = now + timedelta(minutes=15)
+                    end = (start + timedelta(hours=4)).replace(microsecond=0)
+                    # ensure we don't extend beyond today's work hours
+                    if end.hour > 18 or (end.hour == 18 and end.minute > 30):
+                        end = (now.replace(hour=18, minute=30, second=0, microsecond=0))
             return start, end
     except Exception:
+        # fall through to default fallback
         pass
 
     # --- Default fallback ---
