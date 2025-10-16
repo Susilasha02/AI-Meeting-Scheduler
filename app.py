@@ -404,22 +404,18 @@ def _apply_time_preferences_pd(date_pd: pendulum.DateTime, prompt: str):
 
 def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_duration_min: int = 45):
     """
-    Robust prompt -> local ISO window parser. Returns dict with window_start/window_end in LOCAL_TZ.
-    - Normalizes common typos/variants
-    - Removes duration numeric tokens before weekday detection
-    - Prioritizes weekday detection (next/this/plain)
-    - Handles explicit times (2pm, 14:30) and fuzzy tokens (morning/afternoon/evening)
-    - Returns window ISO strings in LOCAL_TZ and keeps attendees extraction
+    Instrumented robust parser: logs normalized prompt, cleaned_for_weekday, TIME_RE matches and branch chosen.
+    Returns the same dict shape as before.
     """
     p_raw = (prompt or "").strip()
     p = p_raw or ""
     if contacts_map is None:
         contacts_map = {}
 
-    # parse duration first (keeps original behavior)
+    # duration
     duration_min = _parse_duration_minutes(p, default_min=default_duration_min)
 
-    # attendees extraction (unchanged)
+    # attendees (unchanged)
     attendees = set()
     email_re = re.compile(r"([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)")
     for e in email_re.findall(p):
@@ -432,14 +428,14 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
         else:
             attendees.add("@" + m)
 
-    # timezone setup
+    # tz
     try:
         tz_pd = pendulum.timezone(LOCAL_TZ)
     except Exception:
         tz_pd = pendulum.timezone("UTC")
     now_local = pendulum.now(tz_pd)
 
-    # normalize lower-case prompt and correct common typos/variants
+    # normalized prompt
     plow = p.lower()
     norm_map = {
         r"\btomm?or?ow\b": "tomorrow",
@@ -459,18 +455,26 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
         plow = re.sub(pat, repl, plow, flags=re.I)
     plow = re.sub(r"\s+", " ", plow).strip()
 
-    # CLEAN the prompt for weekday detection: remove explicit duration tokens and stray numbers
-    cleaned_for_weekday = DUR_RE.sub("", plow)  # remove "30 min", "1 hour"
+    # cleaned_for_weekday removes durations and stray numbers to avoid accidental parse consumption
+    cleaned_for_weekday = DUR_RE.sub("", plow)
     cleaned_for_weekday = re.sub(r"\b\d+\s*(min|mins|minutes|h|hr|hrs)?\b", "", cleaned_for_weekday)
     cleaned_for_weekday = re.sub(r"\bfor\b", "", cleaned_for_weekday)
     cleaned_for_weekday = re.sub(r"\s+", " ", cleaned_for_weekday).strip()
 
-    # helper to format response from a pendulum start datetime
-    def _resp_from_start(start_local: pendulum.DateTime):
+    # debug: what do we see?
+    time_token_match = TIME_RE.search(p) or TIME_RE.search(plow) or TIME_RE.search(cleaned_for_weekday)
+    logger.info("parse_prompt_to_window DEBUG: raw=%r", p_raw)
+    logger.info("parse_prompt_to_window DEBUG: normalized(plow)=%r", plow)
+    logger.info("parse_prompt_to_window DEBUG: cleaned_for_weekday=%r", cleaned_for_weekday)
+    logger.info("parse_prompt_to_window DEBUG: TIME_RE match (orig/plow/cleaned)=%r", bool(time_token_match))
+
+    def _resp_from_start(start_local: pendulum.DateTime, branch_name: str = "unknown"):
         start_local = start_local.set(second=0, microsecond=0)
         if start_local <= now_local:
             start_local = now_local.add(minutes=15).set(second=0, microsecond=0)
         end_local = start_local.add(minutes=duration_min)
+        # log branch info
+        logger.info("parse_prompt_to_window CHOSEN: branch=%s start=%s end=%s", branch_name, start_local.to_iso8601_string(), end_local.to_iso8601_string())
         return {
             "attendees": sorted(attendees) if attendees else ["primary"],
             "duration_min": duration_min,
@@ -478,10 +482,10 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
             "window_end": end_local.to_iso8601_string()
         }
 
-    # 1) Explicit "tomorrow" branch (run early)
+    # 1) tomorrow
     if "tomorrow" in plow:
         base = now_local.add(days=1)
-        tm = TIME_RE.search(p)  # use original prompt for time tokens (preserves formats)
+        tm = TIME_RE.search(p) or TIME_RE.search(plow)
         if tm:
             hour, minute = parse_time_token(tm.group(1))
             hour = 9 if hour is None else hour
@@ -489,48 +493,33 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
             base = base.set(hour=hour, minute=minute, second=0, microsecond=0)
         else:
             base = _apply_time_preferences_pd(base, p)
-        logger.info("parse_prompt_to_window: branch=tomorrow")
-        return _resp_from_start(base)
+        return _resp_from_start(base, "tomorrow")
 
-    # 2) Weekday detection (next/this/plain) using cleaned text
+    # 2) weekday detection on cleaned text
     wd = re.search(r"\b(?:(next|this)\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", cleaned_for_weekday)
     if wd:
         prefix = (wd.group(1) or "").lower()
         weekday_name = wd.group(2).lower()
-        target_idx = WEEKDAY_MAP[weekday_name]  # 0..6 Mon..Sun
-
-        # compute minimal days ahead
-        days_ahead = (target_idx - now_local.day_of_week) % 7
-        # plain mention: if it is today (days_ahead==0) prefer next week to avoid accidental 'today'
+        idx = WEEKDAY_MAP[weekday_name]
+        days_ahead = (idx - now_local.day_of_week) % 7
         if not prefix and days_ahead == 0:
             days_ahead = 7
-
-        # adjust for prefix
         if prefix == "next":
-            # ensure we go to the following week
             days_ahead = days_ahead + 7 if days_ahead <= 7 else days_ahead + 7
-        elif prefix == "this":
-            # keep days_ahead as-is; if resolves to today but time passed, bump week later
-            pass
-
-        target_date = now_local.add(days=days_ahead)
-        tm = TIME_RE.search(p)
+        target = now_local.add(days=days_ahead)
+        tm = TIME_RE.search(p) or TIME_RE.search(plow)
         if tm:
             hour, minute = parse_time_token(tm.group(1))
             hour = 9 if hour is None else hour
             minute = 0 if minute is None else minute
-            start_local = target_date.set(hour=hour, minute=minute, second=0, microsecond=0)
+            target = target.set(hour=hour, minute=minute, second=0, microsecond=0)
         else:
-            start_local = _apply_time_preferences_pd(target_date, p)
+            target = _apply_time_preferences_pd(target, p)
+        if target <= now_local:
+            target = target.add(weeks=1)
+        return _resp_from_start(target, f"weekday({weekday_name},prefix={prefix})")
 
-        # safety: if start still in past, push week
-        if start_local <= now_local:
-            start_local = start_local.add(weeks=1)
-
-        logger.info("parse_prompt_to_window: branch=weekday matched (%s, prefix=%s)", weekday_name, prefix)
-        return _resp_from_start(start_local)
-
-    # 3) Explicit full-date/time parsing (e.g., "15 Oct 3pm")
+    # 3) explicit pendulum parse
     try:
         parsed = None
         try:
@@ -539,20 +528,19 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
             parsed = None
         if parsed:
             parsed_local = parsed.in_timezone(tz_pd)
-            has_time = bool(TIME_RE.search(p))
+            has_time = bool(TIME_RE.search(p) or TIME_RE.search(plow))
             if not has_time:
                 parsed_local = _apply_time_preferences_pd(parsed_local.start_of("day"), p)
             if parsed_local <= now_local:
                 parsed_local = parsed_local.add(days=1)
-            logger.info("parse_prompt_to_window: branch=pendulum_parse")
-            return _resp_from_start(parsed_local)
+            return _resp_from_start(parsed_local, "pendulum_parse")
     except Exception:
         pass
 
-    # 4) "today" branch
+    # 4) today
     if "today" in plow:
         base = now_local
-        tm = TIME_RE.search(p)
+        tm = TIME_RE.search(p) or TIME_RE.search(plow)
         if tm:
             hour, minute = parse_time_token(tm.group(1))
             hour = 9 if hour is None else hour
@@ -560,29 +548,26 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
             base = base.set(hour=hour, minute=minute, second=0, microsecond=0)
         else:
             base = _apply_time_preferences_pd(base, p)
-        logger.info("parse_prompt_to_window: branch=today")
-        return _resp_from_start(base)
+        return _resp_from_start(base, "today")
 
-    # 5) "in X days"
+    # 5) in X days
     m_in = re.search(r"in\s+(\d+)\s+day", plow)
     if m_in:
         delta = int(m_in.group(1))
         target = now_local.add(days=delta)
-        start_local = _apply_time_preferences_pd(target.set(hour=9, minute=0, second=0), p)
-        logger.info("parse_prompt_to_window: branch=in_x_days delta=%s", delta)
-        return _resp_from_start(start_local)
+        target = _apply_time_preferences_pd(target.set(hour=9, minute=0), p)
+        return _resp_from_start(target, f"in_{delta}_days")
 
-    # 6) "next week"
+    # 6) next week
     if "next week" in plow:
         days_until_monday = ((0 - now_local.day_of_week) % 7) or 7
         start = now_local.add(days=days_until_monday + 7).set(hour=9, minute=0, second=0)
-        logger.info("parse_prompt_to_window: branch=next_week")
-        return _resp_from_start(start)
+        return _resp_from_start(start, "next_week")
 
-    # Final fallback: rolling 1..5 days (work hours)
+    # fallback
     fallback_start = now_local.add(days=1).set(hour=9, minute=0, second=0)
     fallback_end = fallback_start.add(days=4).set(hour=18, minute=30, second=0)
-    logger.info("parse_prompt_to_window: branch=fallback (prompt=%s)", p_raw)
+    logger.info("parse_prompt_to_window CHOSEN: branch=fallback start=%s end=%s prompt=%s", fallback_start.to_iso8601_string(), fallback_end.to_iso8601_string(), p_raw)
     return {
         "attendees": sorted(attendees) if attendees else ["primary"],
         "duration_min": duration_min,
