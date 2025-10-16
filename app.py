@@ -61,6 +61,31 @@ def to_local(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=zoneinfo.ZoneInfo("UTC"))
     return dt.astimezone(tz)
+# ---------- pendulum-aware helpers ----------
+def to_rfc3339_with_tz(dt):
+    """
+    Accepts a pendulum.DateTime or datetime (aware or naive).
+    Returns an ISO8601/RFC3339 string including timezone offset.
+    """
+    # Ensure we use a pendulum instance so .to_iso8601_string() is available
+    try:
+        pd = pendulum.instance(dt)
+    except Exception:
+        # fallback: treat naive as UTC
+        pd = pendulum.instance(dt).in_timezone("UTC")
+    return pd.to_iso8601_string()
+
+def pretty(dt: datetime) -> str:
+    """
+    Human-friendly display in LOCAL_TZ (uses pendulum under the hood).
+    Accepts naive UTC datetimes, timezone-aware datetimes, or pendulum objects.
+    """
+    try:
+        pd = pendulum.instance(dt)
+    except Exception:
+        pd = pendulum.now("UTC")
+    local = pd.in_timezone(LOCAL_TZ)
+    return local.strftime("%a, %d %b %Y %I:%M %p") + f" ({LOCAL_TZ})"
 
 def pretty(dt: datetime) -> str:
     l = to_local(dt)
@@ -300,13 +325,12 @@ def _next_weekday_after(base_date: datetime, weekday_index: int, at_least_one_we
         days_ahead += 7
     return base_date + timedelta(days=days_ahead)
 
-def parse_time_token(time_text: str, tz):
+def parse_time_token(time_text: str):
     """
-    Parse a short time token like '2pm', '14:30', '2:15 pm' and return (hour, minute).
-    Deterministic manual parse first; fallback to pendulum.parse for edge cases.
+    Parse '2pm', '14:30', '2:15 pm' deterministically. Returns (hour, minute) or (None, None).
     """
-    time_text = (time_text or "").strip()
-    # manual regex parse
+    if not time_text:
+        return None, None
     m = re.match(r"^\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*$", time_text, re.I)
     if m:
         hour = int(m.group(1))
@@ -318,40 +342,28 @@ def parse_time_token(time_text: str, tz):
             hour = 0
         if 0 <= hour < 24 and 0 <= minute < 60:
             return hour, minute
-    # fallback to pendulum's parser (less strict)
+    # fallback to pendulum parsing (less strict)
     try:
         p = pendulum.parse(time_text, strict=False)
         return p.hour, p.minute
     except Exception:
         return None, None
 
-def _apply_time_preferences(dt_date: datetime, prompt: str, local_tz: zoneinfo.ZoneInfo):
+
+def _apply_time_preferences_pd(date_pd: pendulum.DateTime, prompt: str):
     """
-    Given a date (may have 0:00 time), pick an appropriate time and return
-    A *pendulum.DateTime* (tz-aware).
-    - explicit time tokens (11am, 2:30pm) -> used
-    - morning->09:00, afternoon->14:00, evening/night->18:00
-    - default 09:00
+    Given a pendulum date (tz-aware), set hour/minute according to prompt tokens.
+    Returns a pendulum.DateTime in the same timezone.
     """
     p = (prompt or "").lower()
-    tz = None
-    try:
-        tz = pendulum.timezone(LOCAL_TZ)
-    except Exception:
-        tz = pendulum.timezone("UTC")
+    # explicit time token
+    tm = TIME_RE.search(prompt)
+    if tm:
+        hour, minute = parse_time_token(tm.group(1))
+        if hour is None:
+            hour, minute = 9, 0
+        return date_pd.set(hour=hour, minute=minute, second=0, microsecond=0)
 
-    # If dt_date is a naive datetime (from earlier code), convert to pendulum date w/ same date
-    date_pd = pendulum.datetime(dt_date.year, dt_date.month, dt_date.day, tz=tz)
-
-    tm_match = TIME_RE.search(prompt)
-    if tm_match:
-        hh, mm = parse_time_token(tm_match.group(1), tz)
-        if hh is None:
-            # fallback to 09:00
-            hh, mm = 9, 0
-        return date_pd.set(hour=hh, minute=mm, second=0, microsecond=0)
-
-    # keyword times
     if "morning" in p:
         return date_pd.set(hour=9, minute=0, second=0)
     if "afternoon" in p:
@@ -362,17 +374,17 @@ def _apply_time_preferences(dt_date: datetime, prompt: str, local_tz: zoneinfo.Z
     # default
     return date_pd.set(hour=9, minute=0, second=0)
 
-# ---------- Pendulum-backed parse helpers ----------
+
 def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_duration_min: int = 45):
     """
-    Pendulum-backed parser. Returns dict:
+    Pendulum-based parser returning offset-preserving ISO windows.
+    Returns dict:
       {
         "attendees": [...],
         "duration_min": int,
-        "window_start": rfc3339(start_utc_naive),
-        "window_end": rfc3339(end_utc_naive)
+        "window_start": ISO-with-offset,
+        "window_end": ISO-with-offset
       }
-    Interprets times in LOCAL_TZ and returns RFC3339 UTC strings (same shape as original).
     """
     p = (prompt or "").strip()
     if contacts_map is None:
@@ -380,7 +392,7 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
 
     duration_min = _parse_duration_minutes(p, default_min=default_duration_min)
 
-    # attendees: allow @username mentions (Teams style) or emails in prompt
+    # attendees extraction (same as before)
     attendees = set()
     email_re = re.compile(r"([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)")
     for e in email_re.findall(p):
@@ -393,135 +405,156 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
         else:
             attendees.add("@" + m)
 
-    # timezone tools (pendulum)
+    # timezone
     try:
-        tz = pendulum.timezone(LOCAL_TZ)
+        tz_pd = pendulum.timezone(LOCAL_TZ)
     except Exception:
-        tz = pendulum.timezone("UTC")
+        tz_pd = pendulum.timezone("UTC")
 
-    now_local = pendulum.now(tz)
-
+    now_local = pendulum.now(tz_pd)
     plow = p.lower()
 
-    # 1) explicit weekday/time via regex shortcuts (fast path)
-    # time token present?
-    
-    m_time = TIME_RE.search(p)
-    if m_time:
-        time_text = m_time.group(1)
-        # parse deterministic hour/minute
+    # 1) Try to parse entire prompt using pendulum (handles many cases like "tomorrow 3pm", "15 Oct 3pm")
+    try:
+        parsed = pendant = None
         try:
-            tz_pd = pendulum.timezone(LOCAL_TZ)
+            parsed = pendulum.parse(p, strict=False)
         except Exception:
-            tz_pd = pendulum.timezone("UTC")
+            parsed = None
 
-        hour, minute = parse_time_token(time_text, tz_pd)
-        if hour is None:
-            hour, minute = 9, 0
+        if parsed:
+            # Make into local timezone instance
+            parsed_local = parsed.in_timezone(tz_pd)
+            # If parsed_local is before now and user explicitly said "today", push forward to tomorrow
+            if parsed_local <= now_local:
+                # Only bump if it seems the user intended today (contains 'today') or if parsed date == today
+                if "today" in plow or parsed_local.date() == now_local.date():
+                    parsed_local = parsed_local.add(days=1)
+                else:
+                    # If explicit future phrasing present, keep parsed_local (but if it's past, bump one day conservatively)
+                    parsed_local = parsed_local.add(days=1)
 
-        # choose date: if user said 'tomorrow', that wins; if 'next <weekday>' handled earlier
-        if "tomorrow" in plow:
-            candidate = pendulum.now(tz_pd).add(days=1).set(hour=hour, minute=minute, second=0, microsecond=0)
-        else:
-            candidate = pendulum.now(tz_pd).set(hour=hour, minute=minute, second=0, microsecond=0)
-        # if time already passed today, move to next day for user intent
-            if candidate <= pendulum.now(tz_pd):
-                candidate = candidate.add(days=1)
+            # If no explicit time in prompt, apply preferences
+            has_time = bool(TIME_RE.search(p))
+            if not has_time:
+                parsed_local = _apply_time_preferences_pd(parsed_local.start_of("day"), p)
 
-        start_local = candidate
-        start_utc = start_local.in_timezone("UTC").naive()
-        end_utc = (start_local.add(minutes=duration_min)).in_timezone("UTC").naive()
+            start_local = parsed_local
+            end_local = start_local.add(minutes=duration_min)
+            # convert to UTC for API but preserve timezone strings via helper
+            start_utc = start_local.in_timezone("UTC")
+            end_utc = end_local.in_timezone("UTC")
+            return {
+                "attendees": sorted(attendees) if attendees else ["primary"],
+                "duration_min": duration_min,
+                "window_start": to_rfc3339_with_tz(start_utc),
+                "window_end": to_rfc3339_with_tz(end_utc)
+            }
+    except Exception:
+        # fall back to subsequent heuristics
+        pass
+
+    # 2) weekdays handling (next/this/plain)
+    m_next = NEXT_WEEKDAY_RE.search(p)
+    if m_next:
+        weekday = m_next.group(1).lower()
+        target = WEEKDAY_MAP[weekday]
+        # always the next week's weekday (at least +7 days)
+        days_ahead = (target - now_local.weekday()) % 7
+        if days_ahead == 0:
+            days_ahead = 7
+        days_ahead += 7  # enforce next week
+        target_date = now_local.add(days=days_ahead)
+        start_local = _apply_time_preferences_pd(target_date, p)
+        if start_local <= now_local:
+            start_local = start_local.add(days=7)
+        start_utc = start_local.in_timezone("UTC")
+        end_utc = start_utc.add(minutes=duration_min)
         return {
             "attendees": sorted(attendees) if attendees else ["primary"],
             "duration_min": duration_min,
-            "window_start": rfc3339(start_utc),
-            "window_end": rfc3339(end_utc)
+            "window_start": to_rfc3339_with_tz(start_utc),
+            "window_end": to_rfc3339_with_tz(end_utc)
         }
-    # handle "this <weekday>"
+
     m_this = THIS_WEEKDAY_RE.search(p)
     if m_this:
         weekday = m_this.group(1).lower()
-        idx = WEEKDAY_MAP[weekday]
-        days_ahead = (idx - now_local.day_of_week) % 7
-        date = now_local.add(days=days_ahead)
-        start_local_dt = _apply_time_preferences(datetime(date.year, date.month, date.day), p, zoneinfo.ZoneInfo(LOCAL_TZ))
-        start_local = pendulum.instance(start_local_dt, tz)
+        target = WEEKDAY_MAP[weekday]
+        days_ahead = (target - now_local.weekday()) % 7
+        if days_ahead == 0:
+            # "this [weekday]" interpreted as next week if today passed
+            days_ahead = 7
+        target_date = now_local.add(days=days_ahead)
+        start_local = _apply_time_preferences_pd(target_date, p)
         if start_local <= now_local:
-            # push to next week's same weekday
             start_local = start_local.add(days=7)
-        start_utc = start_local.in_timezone("UTC").naive()
-        end_utc = (start_local.add(minutes=duration_min)).in_timezone("UTC").naive()
-        return {"attendees": sorted(attendees) if attendees else ["primary"], "duration_min": duration_min, "window_start": rfc3339(start_utc), "window_end": rfc3339(end_utc)}
-
-    # 2) explicit time token (e.g., "11am", "3:30pm")
-    if m_time:
-        time_text = m_time.group(1)
-        # try robust parsing via pendulum; fallback to manual parse
-        try:
-            parsed_time = pendulum.parse(time_text, strict=False)
-            hour = parsed_time.hour
-            minute = parsed_time.minute
-        except Exception:
-            mm = re.match(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", time_text, re.I)
-            if mm:
-                hour = int(mm.group(1))
-                minute = int(mm.group(2) or 0)
-                mer = (mm.group(3) or "").lower()
-                if mer == "pm" and hour < 12:
-                    hour += 12
-                if mer == "am" and hour == 12:
-                    hour = 0
-            else:
-                hour, minute = 9, 0
-
-        # choose date: if 'tomorrow' mentioned use tomorrow, else today (and if passed, use next day)
-        if "tomorrow" in plow:
-            candidate = now_local.add(days=1).set(hour=hour, minute=minute, second=0, microsecond=0)
-        else:
-            candidate = now_local.set(hour=hour, minute=minute, second=0, microsecond=0)
-            if candidate <= now_local:
-                candidate = candidate.add(days=1)
-
-        start_local = candidate
-        start_utc = start_local.in_timezone("UTC").naive()
-        end_utc = (start_local.add(minutes=duration_min)).in_timezone("UTC").naive()
-        return {"attendees": sorted(attendees) if attendees else ["primary"], "duration_min": duration_min, "window_start": rfc3339(start_utc), "window_end": rfc3339(end_utc)}
+        start_utc = start_local.in_timezone("UTC")
+        end_utc = start_utc.add(minutes=duration_min)
+        return {
+            "attendees": sorted(attendees) if attendees else ["primary"],
+            "duration_min": duration_min,
+            "window_start": to_rfc3339_with_tz(start_utc),
+            "window_end": to_rfc3339_with_tz(end_utc)
+        }
 
     # 3) shortcuts: today / tomorrow / in X days
     if "today" in plow:
-        # choose next available near now
-        start_local = now_local.add(minutes=15)
-        if start_local.hour >= 23:
-            start_local = now_local.add(days=1).set(hour=9, minute=0, second=0, microsecond=0)
-        start_utc = start_local.in_timezone("UTC").naive()
-        end_utc = (start_local.add(minutes=duration_min)).in_timezone("UTC").naive()
-        return {"attendees": sorted(attendees) if attendees else ["primary"], "duration_min": duration_min, "window_start": rfc3339(start_utc), "window_end": rfc3339(end_utc)}
+        # next available near now (15 minute buffer)
+        candidate = now_local.add(minutes=15).replace(second=0, microsecond=0)
+        # if it's late-night push to next morning
+        if candidate.hour >= 23:
+            candidate = now_local.add(days=1).set(hour=9, minute=0, second=0)
+        start_local = candidate
+        end_local = start_local.add(minutes=duration_min)
+        start_utc = start_local.in_timezone("UTC")
+        end_utc = end_local.in_timezone("UTC")
+        return {
+            "attendees": sorted(attendees) if attendees else ["primary"],
+            "duration_min": duration_min,
+            "window_start": to_rfc3339_with_tz(start_utc),
+            "window_end": to_rfc3339_with_tz(end_utc)
+        }
 
     if "tomorrow" in plow:
-        tomorrow = now_local.add(days=1).set(hour=9, minute=0, second=0, microsecond=0)
-        start_local = tomorrow
+        candidate = now_local.add(days=1).set(hour=9, minute=0, second=0)
+        start_local = _apply_time_preferences_pd(candidate, p)
         if start_local <= now_local:
             start_local = start_local.add(days=1)
-        start_utc = start_local.in_timezone("UTC").naive()
-        return {"attendees": sorted(attendees) if attendees else ["primary"], "duration_min": duration_min, "window_start": rfc3339(start_utc), "window_end": rfc3339((start_local.add(minutes=duration_min)).in_timezone('UTC').naive())}
+        start_utc = start_local.in_timezone("UTC")
+        end_utc = start_utc.add(minutes=duration_min)
+        return {
+            "attendees": sorted(attendees) if attendees else ["primary"],
+            "duration_min": duration_min,
+            "window_start": to_rfc3339_with_tz(start_utc),
+            "window_end": to_rfc3339_with_tz(end_utc)
+        }
 
     m_in = re.search(r"in\s+(\d+)\s+day", plow)
     if m_in:
         delta = int(m_in.group(1))
-        target = now_local.add(days=delta).set(hour=9, minute=0, second=0, microsecond=0)
-        start_utc = target.in_timezone("UTC").naive()
-        return {"attendees": sorted(attendees) if attendees else ["primary"], "duration_min": duration_min, "window_start": rfc3339(start_utc), "window_end": rfc3339((target.add(minutes=duration_min)).in_timezone('UTC').naive())}
+        target = now_local.add(days=delta)
+        start_local = target.set(hour=9, minute=0, second=0)
+        start_local = _apply_time_preferences_pd(start_local, p)
+        start_utc = start_local.in_timezone("UTC")
+        end_utc = start_utc.add(minutes=duration_min)
+        return {
+            "attendees": sorted(attendees) if attendees else ["primary"],
+            "duration_min": duration_min,
+            "window_start": to_rfc3339_with_tz(start_utc),
+            "window_end": to_rfc3339_with_tz(end_utc)
+        }
 
-    # 4) final fallback: rolling window next 1-5 days
-    fallback_start = now_local.add(days=1).set(hour=9, minute=0, second=0, microsecond=0)
-    fallback_end = now_local.add(days=5).set(hour=18, minute=30, second=0, microsecond=0)
-    fallback_start_utc = fallback_start.in_timezone("UTC").naive()
-    fallback_end_utc = fallback_end.in_timezone("UTC").naive()
+    # 4) final fallback: rolling window next 1-5 days (work hours)
+    fallback_start = now_local.add(days=1).set(hour=9, minute=0, second=0)
+    fallback_end = fallback_start.add(days=min(5,  days_ahead if (days_ahead := 5) else 5)).set(hour=18, minute=30)
+    start_utc = fallback_start.in_timezone("UTC")
+    end_utc = fallback_end.in_timezone("UTC")
     return {
         "attendees": sorted(attendees) if attendees else ["primary"],
         "duration_min": duration_min,
-        "window_start": rfc3339(fallback_start_utc),
-        "window_end": rfc3339(fallback_end_utc)
+        "window_start": to_rfc3339_with_tz(start_utc),
+        "window_end": to_rfc3339_with_tz(end_utc)
     }
 
 # Wrapper parse_prompt to produce the config suggest() expects
@@ -882,38 +915,51 @@ def suggest(body: dict = Body(default={})):
             attendees = ["primary"]
 
         # compute window: either explicit window OR derived from prompt + today_only
+                # compute window: either explicit window OR derived from prompt + today_only
         start_iso = body.get("window_start")
         end_iso   = body.get("window_end")
         prompt_text = body.get("prompt", "")
         today_only_flag = bool(body.get("today_only", False))
 
         if start_iso and end_iso:
-            start = dparse.isoparse(start_iso)
-            end   = dparse.isoparse(end_iso)
+            # Parse RFC3339 (offset-aware) using pendulum to preserve tz
+            start_pd = pendulum.parse(start_iso)
+            end_pd = pendulum.parse(end_iso)
+            # Keep pendulum objects (timezone-aware). We'll convert to UTC strings for freebusy.
+            start = start_pd
+            end = end_pd
         else:
             if prompt_text:
+                # produce a local window (already returns offset-aware ISO strings)
                 if today_only_flag:
-                    # clamp to today in LOCAL_TZ
                     start_dt, end_dt = get_search_window_from_prompt(prompt_text, days_ahead=0)
                 else:
                     start_dt, end_dt = get_search_window_from_prompt(prompt_text, days_ahead=7)
-                # start_dt/end_dt are pendulum DateTimes (tz-aware); convert to UTC-aware datetimes
-                try:
-                    start = start_dt.astimezone(zoneinfo.ZoneInfo("UTC"))
-                    end = end_dt.astimezone(zoneinfo.ZoneInfo("UTC"))
-                except Exception:
-                    # fallback convert via .in_timezone if underlying object is pendulum
-                    try:
-                        start = dparse.isoparse(start_dt.to_iso8601_string())
-                        end = dparse.isoparse(end_dt.to_iso8601_string())
-                    except Exception:
-                        now = datetime.utcnow()
-                        start = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
-                        end   = (now + timedelta(days=5)).replace(hour=18, minute=30, second=0, microsecond=0)
+                # get_search_window_from_prompt returns tz-aware datetimes — ensure pendulum instances
+                start = pendulum.instance(start_dt)
+                end = pendulum.instance(end_dt)
             else:
-                now = datetime.utcnow()
-                start = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
-                end   = (now + timedelta(days=5)).replace(hour=18, minute=30, second=0, microsecond=0)
+                now = pendulum.now("UTC")
+                start = now.add(days=1).set(hour=9, minute=0, second=0)
+                end = now.add(days=5).set(hour=18, minute=30, second=0)
+
+        # Prepare ISO strings with explicit UTC offset for freebusy call
+        start_iso_for_api = to_rfc3339_with_tz(pendulum.instance(start).in_timezone("UTC"))
+        end_iso_for_api = to_rfc3339_with_tz(pendulum.instance(end).in_timezone("UTC"))
+
+        # call freebusy (it expects RFC3339 strings). freebusy returns busy intervals with offsets.
+        fb = freebusy(creds, attendees, start_iso_for_api, end_iso_for_api)
+
+        # Convert busy results into lists used by compute_free
+        busy_lists = [[{"start": b["start"], "end": b["end"]} for b in fb[cal]] for cal in fb]
+
+        # For compute_free we will use timezone-aware UTC pendulum datetimes
+        # compute_free expects datetime objects; pendulum instances are accepted
+        start_pd_utc = pendulum.parse(start_iso_for_api)
+        end_pd_utc = pendulum.parse(end_iso_for_api)
+
+        free = compute_free(busy_lists, start_pd_utc, end_pd_utc)
+
 
         # call freebusy
         fb = freebusy(creds, attendees, rfc3339(start), rfc3339(end))
@@ -1077,11 +1123,12 @@ def book(body: dict):
         subject = body.get("subject", "Timetable-Aware Meeting")
         explanation = body.get("why", "Scheduled by AI bot.")
         tz = body.get("time_zone", LOCAL_TZ)
-
+        
         def to_rfc3339(x: str) -> str:
             dt = dparse.isoparse(x)
             if dt.tzinfo is None: return dt.isoformat()+"Z"
             return dt.isoformat()
+        
 
         ev = insert_event(
             creds, "primary", subject,
