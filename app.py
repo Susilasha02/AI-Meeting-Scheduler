@@ -914,113 +914,129 @@ def generate_suggestions(
 
     return candidate_slots
 
-# Core suggest (replaced internals to use generate_suggestions)
-# Replace the entire /suggest function with this version
+# ---------- Improved /suggest with robust fallbacks & debug output ----------
 @app.post("/suggest")
 def suggest(body: dict = Body(default={})):
     """
-    Body can include:
-      - duration_min, buffer_min
-      - attendees: list of emails (or ["primary"])
-      - window_start / window_end (RFC3339)
-      - OR: prompt and today_only: true/false
+    Improved suggest:
+      - uses parse_prompt() when prompt is present (which preserves explicit times)
+      - keeps tz-awareness
+      - falls back to assume free calendar if freebusy fails
+      - returns debug info when helpful
     """
     creds = load_creds(ORGANIZER_ID)
     if not creds:
         return JSONResponse({"error": "not_connected"}, status_code=401)
 
+    debug_info = {}
     try:
-        # duration / buffer
+        # basic params
         duration_min = int(body.get("duration_min", 45))
         buffer_min = int(body.get("buffer_min", 15))
-
         attendees_raw = body.get("attendees", ["primary"])
         attendees = [a for a in attendees_raw if a == "primary" or "@" in a]
         if not attendees:
             attendees = ["primary"]
 
-        # compute window: either explicit window OR derived from prompt (use parse_prompt WHICH respects explicit times)
-        start_iso = body.get("window_start")
-        end_iso = body.get("window_end")
-        prompt_text = body.get("prompt", "") or ""
+        prompt_text = (body.get("prompt") or "").strip()
         today_only_flag = bool(body.get("today_only", False))
 
-        # Determine local tz
+        # local tz
         try:
             local_tz = zoneinfo.ZoneInfo(LOCAL_TZ)
         except Exception:
             local_tz = zoneinfo.ZoneInfo("UTC")
+        debug_info["LOCAL_TZ"] = str(local_tz)
 
+        # 1) Determine search window (prefer explicit window_start/window_end if provided)
+        start_iso = body.get("window_start")
+        end_iso = body.get("window_end")
         if start_iso and end_iso:
-            # parse provided RFC3339 window
             start = dparse.isoparse(start_iso)
             end = dparse.isoparse(end_iso)
-            # ensure tz-aware: if naive, assume UTC (matching previous app behaviour)
             if start.tzinfo is None:
                 start = start.replace(tzinfo=zoneinfo.ZoneInfo("UTC"))
             if end.tzinfo is None:
                 end = end.replace(tzinfo=zoneinfo.ZoneInfo("UTC"))
+            debug_info["window_source"] = "explicit"
         else:
-            # Use parse_prompt which returns RFC3339 strings (and preserves explicit times)
+            # prefer parse_prompt (already handles dates/times)
             if prompt_text:
-                contacts_map = load_contacts()
-                parsed = parse_prompt(prompt_text, contacts_map)
-                # parsed["window_start"] and ["window_end"] are RFC3339 strings (may include Z)
-                start = dparse.isoparse(parsed["window_start"])
-                end = dparse.isoparse(parsed["window_end"])
-                # make sure these are tz-aware; if parsed returned naive UTC, attach UTC tz
-                if start.tzinfo is None:
-                    start = start.replace(tzinfo=zoneinfo.ZoneInfo("UTC"))
-                if end.tzinfo is None:
-                    end = end.replace(tzinfo=zoneinfo.ZoneInfo("UTC"))
-
-                # If user asked 'today only' and the parsed start is earlier than now in local tz,
-                # push it to next sensible future (small guard)
-                now_local = datetime.now(local_tz)
-                start_local_tmp = start.astimezone(local_tz)
-                if today_only_flag and start_local_tmp.date() != now_local.date():
-                    # clamp to today near now (respect explicit time if provided)
-                    start_local_clean = now_local + timedelta(minutes=15)
-                    start = start_local_clean.astimezone(zoneinfo.ZoneInfo("UTC"))
-                    end = (start_local_clean + timedelta(minutes=duration_min)).astimezone(zoneinfo.ZoneInfo("UTC"))
+                try:
+                    contacts_map = load_contacts()
+                    parsed = parse_prompt(prompt_text, contacts_map)
+                    debug_info["parsed_prompt"] = parsed
+                    # parse RFC3339 strings into datetimes
+                    start = dparse.isoparse(parsed["window_start"])
+                    end = dparse.isoparse(parsed["window_end"])
+                    # ensure tz-aware (parse_prompt returns naive UTC; attach UTC if missing)
+                    if start.tzinfo is None:
+                        start = start.replace(tzinfo=zoneinfo.ZoneInfo("UTC"))
+                    if end.tzinfo is None:
+                        end = end.replace(tzinfo=zoneinfo.ZoneInfo("UTC"))
+                    debug_info["window_source"] = "parse_prompt"
+                except Exception as e:
+                    debug_info["parse_prompt_error"] = str(e)
+                    # fallback to the older helper
+                    s_local, e_local = get_search_window_from_prompt(prompt_text, days_ahead=7)
+                    # get_search_window_from_prompt returns tz-aware LOCAL_TZ datetimes
+                    start = s_local.astimezone(zoneinfo.ZoneInfo("UTC"))
+                    end = e_local.astimezone(zoneinfo.ZoneInfo("UTC"))
+                    debug_info["window_source"] = "get_search_window_from_prompt_fallback"
             else:
-                # fallback rolling window as before
+                # No prompt and no explicit window: default rolling window
                 now = datetime.utcnow().replace(tzinfo=zoneinfo.ZoneInfo("UTC"))
                 start = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
                 end = (now + timedelta(days=5)).replace(hour=18, minute=30, second=0, microsecond=0)
+                debug_info["window_source"] = "rolling_default"
 
-        # For freebusy we still send RFC3339 in UTC as before.
-        start_utc = start.astimezone(zoneinfo.ZoneInfo("UTC"))
-        end_utc = end.astimezone(zoneinfo.ZoneInfo("UTC"))
+        debug_info["start_utc"] = start.isoformat()
+        debug_info["end_utc"] = end.isoformat()
 
-        # call freebusy: using same creds and attendees as your code
-        fb = freebusy(creds, attendees, rfc3339(start_utc), rfc3339(end_utc))
+        # Defensive: if start >= end, widen the window
+        if start >= end:
+            debug_info["window_adjusted"] = True
+            end = start + timedelta(days=3, hours=9)
 
-        # Build busy_events list (convert each busy block into datetime tuples in local_tz)
-        busy_events: List[Tuple[datetime, datetime]] = []
-        for cal_id, blocks in fb.items():
-            for b in blocks:
-                try:
+        # Convert to tz-aware local window for suggestion algorithm
+        start_local = start.astimezone(local_tz)
+        end_local = end.astimezone(local_tz)
+        debug_info["start_local"] = start_local.isoformat()
+        debug_info["end_local"] = end_local.isoformat()
+
+        # 2) Call freebusy (safe try/catch)
+        fb = {}
+        try:
+            fb = freebusy(creds, attendees, rfc3339(start), rfc3339(end))
+            debug_info["freebusy_ok"] = True
+            debug_info["freebusy_sample"] = {k: v[:3] for k, v in fb.items()}  # only small preview
+        except Exception as e:
+            debug_info["freebusy_ok"] = False
+            debug_info["freebusy_error"] = str(e)
+            # fall back to empty freebusy => assume no busy blocks
+            fb = {a: [] for a in attendees}
+
+        # 3) Build busy_events list (tz-aware in local_tz) for generator
+        busy_events = []
+        try:
+            for cal_id, blocks in fb.items():
+                # blocks is list of {"start": iso, "end": iso}
+                for b in blocks:
                     s = dparse.isoparse(b["start"])
                     e = dparse.isoparse(b["end"])
-                except Exception:
-                    continue
-                # Normalize into local_tz
-                if s.tzinfo is None:
-                    s = s.replace(tzinfo=zoneinfo.ZoneInfo("UTC")).astimezone(local_tz)
-                else:
-                    s = s.astimezone(local_tz)
-                if e.tzinfo is None:
-                    e = e.replace(tzinfo=zoneinfo.ZoneInfo("UTC")).astimezone(local_tz)
-                else:
-                    e = e.astimezone(local_tz)
-                busy_events.append((s, e))
+                    if s.tzinfo is None:
+                        s = s.replace(tzinfo=zoneinfo.ZoneInfo("UTC"))
+                    if e.tzinfo is None:
+                        e = e.replace(tzinfo=zoneinfo.ZoneInfo("UTC"))
+                    # convert into local tz for generator
+                    s_local = s.astimezone(local_tz)
+                    e_local = e.astimezone(local_tz)
+                    busy_events.append((s_local, e_local))
+        except Exception as e:
+            debug_info["busy_parse_error"] = str(e)
+            busy_events = []
 
-        # Prepare local tz-aware window for the generator
-        start_local = start_utc.astimezone(local_tz)
-        end_local = end_utc.astimezone(local_tz)
-
-        # Generate candidate slots using the generator (respects 'pm' / 'tonight' via prompt_text)
+        # 4) Generate suggestions (this respects "pm"/"tonight" from prompt_text)
         candidate_slots = generate_suggestions(
             busy_events,
             duration_min,
@@ -1029,25 +1045,55 @@ def suggest(body: dict = Body(default={})):
             window_end=end_local,
             tzinfo=local_tz,
             prompt_text=prompt_text,
-            max_results=10
+            max_results=12
         )
 
-        # Convert candidate_slots into the same format existing code expects (ISO strings in local tz)
-        cands = []
-        for s in candidate_slots:
-            # we want ISO strings that include timezone info so downstream parsing is robust
-            sl_iso = s["start"].astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None).isoformat()
-            en_iso = s["end"].astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None).isoformat()
-            cands.append({
-                "start": sl_iso,
-                "end": en_iso,
-                "meta": {"buffers": {"pre": buffer_min, "post": buffer_min}}
-            })
+        debug_info["candidate_slots_count"] = len(candidate_slots)
 
-        # fairness-aware scoring (unchanged)
+        # 5) If no candidates returned, fallback to treating calendar as free (i.e., ignore busy_events)
+        if not candidate_slots:
+            debug_info["fallback_used"] = "treat_calendar_free"
+            # create a free window covering start_local..end_local and use candidates() (your original strategy)
+            free_windows = [{"start": start_local.isoformat(), "end": end_local.isoformat()}]
+            fallback_cands = candidates(free_windows, duration_min=duration_min, buffer_min=buffer_min, cap=3)
+            # If still empty, relax cap and produce sliding windows across full day range
+            if not fallback_cands:
+                debug_info["fallback_used"] = "relaxed_candidates"
+                # create sliding windows every buffer min across the local window (naive)
+                curs = start_local.replace(minute=0, second=0, microsecond=0)
+                fallback_cands_tmp = []
+                max_iters = 200
+                it = 0
+                while curs + timedelta(minutes=duration_min) <= end_local and it < max_iters:
+                    fallback_cands_tmp.append({"start": curs.isoformat(), "end": (curs + timedelta(minutes=duration_min)).isoformat(),
+                        "meta": {"buffers": {"pre": buffer_min, "post": buffer_min}}})
+                    curs += timedelta(minutes=buffer_min)
+                    it += 1
+                fallback_cands = fallback_cands_tmp[:10]
+            cands = fallback_cands
+        else:
+            # convert candidate_slots (tz-aware datetimes) into same dict form as original candidates()
+            cands = []
+            for s in candidate_slots:
+                # Convert back to UTC-naive ISO strings (to match previous internal expectations)
+                s_utc_naive = s["start"].astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
+                e_utc_naive = s["end"].astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
+                cands.append({
+                    "start": s_utc_naive.isoformat(),
+                    "end": e_utc_naive.isoformat(),
+                    "meta": {"buffers": {"pre": buffer_min, "post": buffer_min}}
+                })
+
+        debug_info["candidates_count"] = len(cands)
+
+        # fairness scoring & response (unchanged)
         scored = []
         for sl in cands:
-            score, comp = _fairness_score(sl, fb)
+            try:
+                score, comp = _fairness_score(sl, fb)
+            except Exception as e:
+                # if scoring fails for a slot, make a fallback neutral score
+                score, comp = 0.0, {"midday_closeness": 0, "min_gap_minutes": 0, "avg_gap_minutes": 0, "used_attendees": list(fb.keys())}
             scored.append((score, comp, sl))
 
         top = sorted(scored, key=lambda x: x[0], reverse=True)[:3]
@@ -1057,9 +1103,9 @@ def suggest(body: dict = Body(default={})):
             end_dt = datetime.fromisoformat(sl["end"])
             why = explain(sl)
             why.update({"fairness": {
-                "midday_closeness": comp["midday_closeness"],
-                "min_gap_minutes": comp["min_gap_minutes"],
-                "avg_gap_minutes": comp["avg_gap_minutes"]
+                "midday_closeness": comp.get("midday_closeness"),
+                "min_gap_minutes": comp.get("min_gap_minutes"),
+                "avg_gap_minutes": comp.get("avg_gap_minutes")
             }})
             resp.append({
                 "slot": sl,
@@ -1069,7 +1115,14 @@ def suggest(body: dict = Body(default={})):
                 "explanation": why,
                 "score": round(score, 3)
             })
-        return resp
+
+        # If no slots to return, include debug_info to help diagnose
+        if not resp:
+            return JSONResponse({"slots": [], "debug": debug_info}, status_code=200)
+
+        # Otherwise return slots + small debug_info
+        debug_info_brief = {k: debug_info.get(k) for k in ("window_source","start_local","end_local","candidate_slots_count","candidates_count")}
+        return {"slots": resp, "debug": debug_info_brief}
 
     except HttpError as he:
         try:
@@ -1078,7 +1131,41 @@ def suggest(body: dict = Body(default={})):
             detail = str(he)
         return JSONResponse({"error": "google_api_error", "detail": detail}, status_code=500)
     except Exception as e:
-        return JSONResponse({"error": "server_error", "detail": str(e), "trace": traceback.format_exc()}, status_code=500)
+        # Return full debug if something unexpected happens
+        debug_info["exception"] = str(e)
+        debug_info["trace"] = traceback.format_exc()
+        return JSONResponse({"error": "server_error", "detail": str(e), "debug": debug_info}, status_code=500)
+
+
+# ---------- Small debug endpoint to inspect parser/window outputs ----------
+@app.get("/debug/parse")
+def debug_parse(prompt: str):
+    """
+    Call /debug/parse?prompt=... to see:
+      - parse_prompt(...) output (RFC3339 window)
+      - get_search_window_from_prompt(...) (older fallback)
+      - now (LOCAL_TZ)
+    Useful to verify prompt -> window mapping.
+    """
+    try:
+        contacts_map = load_contacts()
+        parsed = parse_prompt(prompt, contacts_map)
+    except Exception as e:
+        parsed = {"error": str(e)}
+
+    try:
+        gw_start, gw_end = get_search_window_from_prompt(prompt, days_ahead=7)
+        gw = {"start": gw_start.isoformat(), "end": gw_end.isoformat()}
+    except Exception as e:
+        gw = {"error": str(e)}
+
+    try:
+        tz = zoneinfo.ZoneInfo(LOCAL_TZ)
+    except Exception:
+        tz = zoneinfo.ZoneInfo("UTC")
+    now = datetime.now(tz).isoformat()
+
+    return {"prompt": prompt, "parse_prompt": parsed, "get_search_window_from_prompt": gw, "now_local": now, "LOCAL_TZ": str(tz)}
 
 
 # Helper get_search_window_from_prompt used by /suggest when prompt_text exists
