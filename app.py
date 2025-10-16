@@ -927,14 +927,12 @@ def suggest(body: dict = Body(default={})):
             start = start_pd
             end = end_pd
         else:
-            if prompt_text:
-                if today_only_flag:
-                    start_dt, end_dt = get_search_window_from_prompt(prompt_text, days_ahead=0)
-                else:
-                    start_dt, end_dt = get_search_window_from_prompt(prompt_text, days_ahead=7)
-                # ensure pendulum instances (tz-aware)
-                start = pendulum.instance(start_dt)
-                end = pendulum.instance(end_dt)
+            # ⚙️ FIX: respect window_start/window_end passed by /nlp/suggest
+            # Do not recompute from prompt again.
+            logger.info("Using window_start/window_end from incoming request instead of recomputing.")
+            if body.get("window_start") and body.get("window_end"):
+                start = pendulum.parse(body["window_start"])
+                end = pendulum.parse(body["window_end"])
             else:
                 now = pendulum.now("UTC")
                 start = now.add(days=1).set(hour=9, minute=0, second=0)
@@ -946,6 +944,8 @@ def suggest(body: dict = Body(default={})):
 
         logger.info("suggest: attendees=%s start=%s end=%s prompt=%s",
                     attendees, start_iso_for_api, end_iso_for_api, prompt_text)
+        logger.info("FINAL search window (local): %s → %s", start, end)
+
 
         # call freebusy (it expects RFC3339 strings)
         fb = freebusy(creds, attendees, start_iso_for_api, end_iso_for_api)
