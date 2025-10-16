@@ -25,6 +25,34 @@ from google.auth.transport.requests import AuthorizedSession
 
 from dateutil import parser as dparse
 import pendulum
+# ------ DEBUG endpoint (temporary) ------
+import inspect, sys, json
+
+@app.get("/_debug_parser")
+def _debug_parser():
+    """
+    Debug: returns where parse_prompt_to_window is loaded from,
+    what it returns for a canonical prompt, and some runtime info.
+    Remove this endpoint after debugging.
+    """
+    try:
+        # Import fresh reference (defensive)
+        from app import parse_prompt_to_window  # noqa: E402
+        src = inspect.getsourcefile(parse_prompt_to_window)
+        try:
+            out = parse_prompt_to_window("30 min meet tomorrow 3pm")
+        except Exception as e:
+            out = {"error_running_parser": str(e)}
+        return {
+            "source_file": src,
+            "parser_result": out,
+            "cwd": os.getcwd(),
+            "sys_path": sys.path[:8],        # show first entries only (safe)
+            "python": sys.version,
+        }
+    except Exception as e:
+        return {"error": str(e), "trace": traceback.format_exc()}
+# ---------------------------------------
 
 load_dotenv()
 
