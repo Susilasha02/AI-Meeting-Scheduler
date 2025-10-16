@@ -1,15 +1,8 @@
-# app.py (updated)
-import os
-import json
-import re
-import traceback
-import uuid
-import zoneinfo
-import urllib.parse
-import logging
-from typing import List, Dict, Tuple, Optional
+import os, json, re, traceback, uuid, zoneinfo, urllib.parse, logging
+from typing import List, Dict, Tuple
 from datetime import datetime, timedelta
 from pathlib import Path
+
 
 from fastapi import FastAPI, Body, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
@@ -17,15 +10,15 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import RedirectResponse
 from dotenv import load_dotenv
 
-# Google auth/libs
+
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.errors import HttpError
 from google.auth.transport.requests import AuthorizedSession
 
+
 from dateutil import parser as dparse
-import dateparser  # pip install dateparser
-from dateparser.search import search_dates
+import pendulum
 
 load_dotenv()
 
@@ -329,15 +322,18 @@ def _apply_time_preferences(dt_date: datetime, prompt: str, local_tz: zoneinfo.Z
     return dt_date.replace(hour=9, minute=0, second=0, microsecond=0, tzinfo=local_tz)
 
 # ---- parse_prompt_to_window (unchanged from your last version) ----
+import pendulum
+
 def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_duration_min: int = 45):
     """
-    Main parser. Returns a dict with keys:
+    Pendulum-backed parser. Returns dict:
       {
         "attendees": [...],
         "duration_min": int,
         "window_start": rfc3339(start_utc_naive),
         "window_end": rfc3339(end_utc_naive)
       }
+    Interprets naive parsed times as LOCAL_TZ and returns RFC3339 UTC strings (matching your existing code expectations).
     """
     p = (prompt or "").strip()
     if contacts_map is None:
@@ -345,179 +341,144 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
 
     duration_min = _parse_duration_minutes(p, default_min=default_duration_min)
 
-    # attendees: allow @username mentions (Teams style) or emails in prompt
+    # attendees: allow @username mentions or emails in prompt
     attendees = set()
-    # email regex (simple)
     email_re = re.compile(r"([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)")
     for e in email_re.findall(p):
         attendees.add(e)
-    # @mentions like @raj or @raj@tenant
     mention_re = re.compile(r"@([a-zA-Z0-9_.-]+)")
     for m in mention_re.findall(p):
         key = m.lower()
         if key in contacts_map:
             attendees.add(contacts_map[key])
         else:
-            # add raw mention form so you can resolve it later in Teams flow
             attendees.add("@" + m)
 
-    # timezone tools
+    # timezone
     try:
-        local_tz = zoneinfo.ZoneInfo(LOCAL_TZ)
+        local_tz_name = LOCAL_TZ or "UTC"
+        tz = pendulum.timezone(local_tz_name)
     except Exception:
-        local_tz = zoneinfo.ZoneInfo("UTC")
+        tz = pendulum.timezone("UTC")
 
-    now_local = datetime.now(local_tz)
-    # 1) try to find explicit date/time using dateparser.search.search_dates (future preference)
-    try:
-        sd = search_dates(p, settings={
-            "PREFER_DATES_FROM": "future",
-            "RELATIVE_BASE": datetime.utcnow(),
-            "RETURN_AS_TIMEZONE_AWARE": False
-        })
-    except Exception:
-        sd = None
+    now_local = pendulum.now(tz)
 
-    # If search_dates found something, prefer first meaningful match
-    if sd:
-        # choose the first match that looks date-like
-        chosen_dt = None
-        for matched_text, dt in sd:
-            cleaned = (matched_text or "").strip()
-            if len(cleaned) <= 1:
-                continue
-            chosen_dt = dt
-            matched_text_chosen = cleaned
-            break
-        if chosen_dt:
-            # Normalize chosen_dt into local tz safely:
-            try:
-                if chosen_dt.tzinfo is None:
-                    # keep naive for now; we'll interpret as local timezone below
-                    chosen_dt = chosen_dt.replace(tzinfo=None)
-                else:
-                    # convert timezone-aware parsed dt into local tz
-                    chosen_dt = chosen_dt.astimezone(local_tz)
-            except Exception:
-                # defensive: if something odd, treat as naive
-                chosen_dt = chosen_dt.replace(tzinfo=None)
+    # try explicit weekday keywords first (fast path)
+    plow = p.lower()
 
-            # Decide whether the parse included an explicit time:
-            # If the user's prompt contains a time token (e.g., "9pm", "09:00", "3:30") we assume the parsed dt carries time.
-            has_explicit_time_in_prompt = bool(TIME_RE.search(p))
-
-            # If the parsed dt looks like a pure date (midnight) AND user did NOT include explicit time,
-            # apply time preferences (morning/afternoon/evening/default).
-            if (getattr(chosen_dt, "hour", 0) == 0 and getattr(chosen_dt, "minute", 0) == 0) and not has_explicit_time_in_prompt:
-                date_only = datetime(year=chosen_dt.year, month=chosen_dt.month, day=chosen_dt.day)
-                start_local = _apply_time_preferences(date_only, p, local_tz)
-            else:
-                # Interpret naive datetimes as local time; if already tz-aware we ensured it's converted above.
-                if chosen_dt.tzinfo is None:
-                    start_local = chosen_dt.replace(tzinfo=local_tz)
-                else:
-                    start_local = chosen_dt.astimezone(local_tz)
-
-                # If the prompt didn't include an explicit time but search_dates still returned a time,
-                # respect the parsed time — but if it's a past time, we'll push it to the next occurrence below.
-
-            # Ensure start_local is in the future. If parsed time is already past (relative to now_local),
-            # move to the next appropriate occurrence (add one day).
-            if start_local <= now_local:
-                # If user asked for a specific date (explicit date text was found that mentions a day or date),
-                # we should not arbitrarily jump many days; adding 1 day is a conservative move ensuring only
-                # past-today times are advanced to the next plausible slot.
-                start_local = start_local + timedelta(days=1)
-
-            # Compute UTC-naive times for API consistency
-            start_utc = start_local.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
-            end_utc = start_utc + timedelta(minutes=duration_min)
-            return {
-                "attendees": sorted(attendees) if attendees else ["primary"],
-                "duration_min": duration_min,
-                "window_start": rfc3339(start_utc),
-                "window_end": rfc3339(end_utc)
-            }
-
-    # 2) explicit phrases next/this weekday handling:
+    # handle explicit "next monday/this friday" using previous helper logic
     m_next = NEXT_WEEKDAY_RE.search(p)
     if m_next:
         weekday = m_next.group(1).lower()
-        target = WEEKDAY_MAP[weekday]
-        # enforce next-week (at_least_one_week_ahead=True)
-        nextday = _next_weekday_after(now_local, target, at_least_one_week_ahead=True)
-        start_local = _apply_time_preferences(nextday, p, local_tz)
-        # if start_local happens to be in the past (unlikely) push forward
-        if start_local <= now_local:
-            start_local = start_local + timedelta(days=7)
-        start_utc = start_local.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
-        end_utc = start_utc + timedelta(minutes=duration_min)
-        return {
-            "attendees": sorted(attendees) if attendees else ["primary"],
-            "duration_min": duration_min,
-            "window_start": rfc3339(start_utc),
-            "window_end": rfc3339(end_utc)
-        }
+        idx = WEEKDAY_MAP[weekday]
+        # compute next-week date
+        target = now_local.next(pendulum.MONDAY) if weekday=="monday" else None
+        # pendulum has .next() for day name; simpler compute:
+        days_ahead = (idx - now_local.day_of_week) % 7
+        if days_ahead == 0:
+            days_ahead = 7
+        # enforce next-week => add 7
+        days_ahead += 7
+        dt_date = now_local.add(days=days_ahead).date()
+        # apply time preferences
+        start_local = _apply_time_preferences(datetime(dt_date.year, dt_date.month, dt_date.day), p, zoneinfo.ZoneInfo(local_tz_name))
+        start_local = pendulum.instance(start_local, tz)  # ensure pendulum object
+        start_local = start_local.replace(second=0, microsecond=0)
+        start_utc = start_local.in_timezone("UTC").naive()
+        end_utc = (start_local.add(minutes=duration_min)).in_timezone("UTC").naive()
+        return {"attendees": sorted(attendees) if attendees else ["primary"], "duration_min": duration_min, "window_start": rfc3339(start_utc), "window_end": rfc3339(end_utc)}
 
     m_this = THIS_WEEKDAY_RE.search(p)
     if m_this:
         weekday = m_this.group(1).lower()
-        target = WEEKDAY_MAP[weekday]
-        nextday = _next_weekday_after(now_local, target, at_least_one_week_ahead=False)
-        start_local = _apply_time_preferences(nextday, p, local_tz)
-        # if start_local was earlier today, push to next week's same weekday
+        idx = WEEKDAY_MAP[weekday]
+        days_ahead = (idx - now_local.day_of_week) % 7
+        if days_ahead == 0:
+            days_ahead = 7 if now_local.hour >= 23 else 0  # if same day late, push to next week
+        dt_date = now_local.add(days=days_ahead).date()
+        start_local = _apply_time_preferences(datetime(dt_date.year, dt_date.month, dt_date.day), p, zoneinfo.ZoneInfo(local_tz_name))
+        start_local = pendulum.instance(start_local, tz)
         if start_local <= now_local:
-            start_local = _next_weekday_after(now_local, target, at_least_one_week_ahead=True)
-            start_local = _apply_time_preferences(start_local, p, local_tz)
-        start_utc = start_local.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
-        end_utc = start_utc + timedelta(minutes=duration_min)
-        return {
-            "attendees": sorted(attendees) if attendees else ["primary"],
-            "duration_min": duration_min,
-            "window_start": rfc3339(start_utc),
-            "window_end": rfc3339(end_utc)
-        }
-
-    # 3) shortcuts: today / tomorrow / in X days
-    plow = p.lower()
-    if "today" in plow:
-        # choose next available near now
-        start_local = now_local + timedelta(minutes=15)  # short buffer
+            start_local = start_local.add(days=7)
         start_local = start_local.replace(second=0, microsecond=0)
-        # If it's already late-night (e.g., after 23:30) push to tomorrow morning
-        if start_local.hour >= 23:
-            start_local = (now_local + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
-        start_utc = start_local.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
-        end_utc = start_utc + timedelta(minutes=duration_min)
-        return {
-            "attendees": sorted(attendees) if attendees else ["primary"],
-            "duration_min": duration_min,
-            "window_start": rfc3339(start_utc),
-            "window_end": rfc3339(end_utc)
-        }
-    if "tomorrow" in plow:
-        tomorrow = (now_local + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
-        start_local = _apply_time_preferences(tomorrow, p, local_tz)
-        # safety: ensure future
-        if start_local <= now_local:
-            start_local = start_local + timedelta(days=1)
-        start_utc = start_local.astimezone(zoneinfo.ZoneInfo("UTC")).replace(tzinfo=None)
-        return {
-            "attendees": sorted(attendees) if attendees else ["primary"],
-            "duration_min": duration_min,
-            "window_start": rfc3339(start_utc),
-            "window_end": rfc3339(start_utc + timedelta(minutes=duration_min))
-        }
+        start_utc = start_local.in_timezone("UTC").naive()
+        end_utc = start_local.add(minutes=duration_min).in_timezone("UTC").naive()
+        return {"attendees": sorted(attendees) if attendees else ["primary"], "duration_min": duration_min, "window_start": rfc3339(start_utc), "window_end": rfc3339(end_utc)}
 
-    # 4) final fallback: rolling window next 1-5 days (existing behavior)
-    fallback_start = (datetime.utcnow() + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
-    fallback_end = (datetime.utcnow() + timedelta(days=5)).replace(hour=18, minute=30, second=0, microsecond=0)
-    return {
-        "attendees": sorted(attendees) if attendees else ["primary"],
-        "duration_min": duration_min,
-        "window_start": rfc3339(fallback_start),
-        "window_end": rfc3339(fallback_end)
-    }
+    # If there's an explicit time token (e.g., "11am", "3:30pm"), pick that time on either today or requested day.
+    tm = TIME_RE.search(p)
+    if tm:
+        # parse numeric time pieces
+        hpart = tm.group(1)
+        # use dateparser? Instead parse with custom logic:
+        time_text = hpart
+        # Use pendulum.parse with locale-aware fallback
+        try:
+            # pendulum's parse may be forgiving but assume time only -> combine with date
+            parsed_time = pendulum.parse(time_text, tz=tz, default=now_local)
+            # parsed_time could include date; normalize to today or tomorrow if contains date
+            candidate = parsed_time
+        except Exception:
+            # fallback simple parse: "3pm" -> hour 15 etc
+            m2 = re.match(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?", hpart, re.I)
+            if m2:
+                hour = int(m2.group(1))
+                minute = int(m2.group(2) or 0)
+                mer = (m2.group(3) or "").lower()
+                if mer == "pm" and hour < 12:
+                    hour += 12
+                if mer == "am" and hour == 12:
+                    hour = 0
+                candidate = now_local.set(hour=hour, minute=minute, second=0, microsecond=0)
+            else:
+                candidate = now_local
+
+        # Determine date for candidate: if prompt mentions "tomorrow" or weekday, use that; else prefer today
+        if "tomorrow" in plow:
+            candidate = candidate.add(days=1)
+        else:
+            # if candidate time already passed today, use tomorrow
+            if candidate <= now_local:
+                candidate = candidate.add(days=1)
+
+        start_local = candidate.replace(second=0, microsecond=0)
+        start_utc = start_local.in_timezone("UTC").naive()
+        end_utc = start_local.add(minutes=duration_min).in_timezone("UTC").naive()
+        return {"attendees": sorted(attendees) if attendees else ["primary"], "duration_min": duration_min, "window_start": rfc3339(start_utc), "window_end": rfc3339(end_utc)}
+
+    # shortcuts: "today" / "tomorrow" / "in X days"
+    if "today" in plow:
+        # pick near-future (now + 15m) or 09:00 if earlier
+        candidate = now_local.add(minutes=15)
+        if candidate.hour < 9:
+            candidate = candidate.set(hour=9, minute=0)
+        start_local = candidate.replace(second=0, microsecond=0)
+        start_utc = start_local.in_timezone("UTC").naive()
+        end_utc = start_local.add(minutes=duration_min).in_timezone("UTC").naive()
+        return {"attendees": sorted(attendees) if attendees else ["primary"], "duration_min": duration_min, "window_start": rfc3339(start_utc), "window_end": rfc3339(end_utc)}
+
+    if "tomorrow" in plow:
+        tomorrow = now_local.add(days=1).set(hour=9, minute=0, second=0, microsecond=0)
+        start_local = tomorrow
+        start_utc = start_local.in_timezone("UTC").naive()
+        end_utc = start_local.add(minutes=duration_min).in_timezone("UTC").naive()
+        return {"attendees": sorted(attendees) if attendees else ["primary"], "duration_min": duration_min, "window_start": rfc3339(start_utc), "window_end": rfc3339(end_utc)}
+
+    m_in = re.search(r"in\s+(\d+)\s+day", plow)
+    if m_in:
+        delta = int(m_in.group(1))
+        target = now_local.add(days=delta).set(hour=9, minute=0, second=0, microsecond=0)
+        start_local = target
+        start_utc = start_local.in_timezone("UTC").naive()
+        end_utc = start_local.add(minutes=duration_min).in_timezone("UTC").naive()
+        return {"attendees": sorted(attendees) if attendees else ["primary"], "duration_min": duration_min, "window_start": rfc3339(start_utc), "window_end": rfc3339(end_utc)}
+
+    # fallback: rolling 1-5 days window starting tomorrow 09:00
+    fallback_start = now_local.add(days=1).set(hour=9, minute=0, second=0, microsecond=0)
+    fallback_end = fallback_start.add(days=4).set(hour=18, minute=30)
+    start_utc = fallback_start.in_timezone("UTC").naive()
+    end_utc = fallback_end.in_timezone("UTC").naive()
+    return {"attendees": sorted(attendees) if attendees else ["primary"], "duration_min": duration_min, "window_start": rfc3339(start_utc), "window_end": rfc3339(end_utc)}
 
 # Wrapper parse_prompt to produce the config suggest() expects
 def parse_prompt(prompt: str, contacts_map: Dict[str, str] = None) -> Dict:
@@ -1171,148 +1132,112 @@ def debug_parse(prompt: str):
 # Helper get_search_window_from_prompt used by /suggest when prompt_text exists
 def get_search_window_from_prompt(prompt: str, days_ahead: int = 7) -> Tuple[datetime, datetime]:
     """
-    Determine a tz-aware local window for searching free slots based on natural prompt.
-    Returns (start_local_dt, end_local_dt) both tz-aware in LOCAL_TZ.
-    Handles 'today', 'tomorrow', weekdays, 'next week', and explicit dates.
+    Pendulum-backed: returns (start_local_dt, end_local_dt) both tz-aware in LOCAL_TZ (pendulum DateTime).
+    Converted where necessary to native datetime objects before returning to the rest of your code.
     """
     try:
-        tz = zoneinfo.ZoneInfo(LOCAL_TZ)
+        tzname = LOCAL_TZ or "UTC"
+        tz = pendulum.timezone(tzname)
     except Exception:
-        tz = zoneinfo.ZoneInfo("UTC")
+        tz = pendulum.timezone("UTC")
 
-    now = datetime.now(tz)
+    now = pendulum.now(tz)
     p = (prompt or "").lower().strip()
 
-    # --- Handle simple relative words ---
+    # simple relative words
     if "today" in p:
-        # if it's late already, allow next-day fallback by UI logic; here keep today's work hours
-        start = now.replace(hour=9, minute=0, second=0, microsecond=0)
-        end = now.replace(hour=18, minute=30, second=0, microsecond=0)
-        # If it's already past work hours, return tomorrow's window instead
+        start = now.set(hour=9, minute=0, second=0, microsecond=0)
+        end = now.set(hour=18, minute=30, second=0, microsecond=0)
+        # if too late, roll to tomorrow
         if now.hour >= 18 and now.minute > 30:
-            tomorrow = now + timedelta(days=1)
-            start = tomorrow.replace(hour=9, minute=0, second=0, microsecond=0)
-            end = tomorrow.replace(hour=18, minute=30, second=0, microsecond=0)
+            tomorrow = now.add(days=1)
+            start = tomorrow.set(hour=9, minute=0, second=0, microsecond=0)
+            end = tomorrow.set(hour=18, minute=30, second=0, microsecond=0)
         return start, end
 
     if "tomorrow" in p:
-        tomorrow = now + timedelta(days=1)
-        start = tomorrow.replace(hour=9, minute=0, second=0, microsecond=0)
-        end = tomorrow.replace(hour=18, minute=30, second=0, microsecond=0)
+        t = now.add(days=1)
+        start = t.set(hour=9, minute=0, second=0, microsecond=0)
+        end = t.set(hour=18, minute=30, second=0, microsecond=0)
         return start, end
 
-    # --- Handle "in X days" ---
     m_in = re.search(r"in\s+(\d+)\s+day", p)
     if m_in:
         delta = int(m_in.group(1))
-        target = now + timedelta(days=delta)
-        start = target.replace(hour=9, minute=0, second=0, microsecond=0)
-        end = target.replace(hour=18, minute=30, second=0, microsecond=0)
+        t = now.add(days=delta)
+        start = t.set(hour=9, minute=0, second=0, microsecond=0)
+        end = t.set(hour=18, minute=30, second=0, microsecond=0)
         return start, end
 
-    # --- Handle "next week" ---
     if "next week" in p:
-        # start at next week's Monday-ish (preserve local tz)
-        days_to_next_week = (7 - now.weekday()) or 7
-        start = (now + timedelta(days=days_to_next_week)).replace(hour=9, minute=0, second=0, microsecond=0)
-        end = start + timedelta(days=5, hours=9, minutes=30)
+        # start next week's Monday-ish
+        days_to_next_week = (7 - now.day_of_week) or 7
+        start = now.add(days=days_to_next_week).set(hour=9, minute=0, second=0, microsecond=0)
+        end = start.add(days=5).set(hour=18, minute=30)
         return start, end
 
-    # --- Handle weekdays ("next Wednesday", "this Monday", plain "Friday") ---
+    # weekdays
     for word, idx in WEEKDAY_MAP.items():
         if f"next {word}" in p:
-            # go to the weekday in the next week
-            delta_days = (idx - now.weekday()) % 7
-            if delta_days == 0:
-                delta_days = 7
-            target = now + timedelta(days=delta_days + 7)
-            start = target.replace(hour=9, minute=0, second=0, microsecond=0)
-            end = target.replace(hour=18, minute=30, second=0, microsecond=0)
+            days_ahead = (idx - now.day_of_week) % 7
+            if days_ahead == 0:
+                days_ahead = 7
+            target = now.add(days=days_ahead + 7)
+            start = target.set(hour=9, minute=0, second=0, microsecond=0)
+            end = target.set(hour=18, minute=30, second=0, microsecond=0)
             return start, end
-
         if f"this {word}" in p:
-            delta_days = (idx - now.weekday()) % 7
-            target = now + timedelta(days=delta_days)
-            start = target.replace(hour=9, minute=0, second=0, microsecond=0)
-            end = target.replace(hour=18, minute=30, second=0, microsecond=0)
-            # if 'this X' resolves to a day earlier today, move to next week's same weekday
+            days_ahead = (idx - now.day_of_week) % 7
+            target = now.add(days=days_ahead)
+            start = target.set(hour=9, minute=0, second=0, microsecond=0)
+            end = target.set(hour=18, minute=30, second=0, microsecond=0)
             if start <= now:
-                target = _next_weekday_after(now, idx, at_least_one_week_ahead=True)
-                start = target.replace(hour=9, minute=0, second=0, microsecond=0)
-                end = target.replace(hour=18, minute=30, second=0, microsecond=0)
+                # push to next week's same weekday
+                target = target.add(days=7)
+                start = target.set(hour=9, minute=0, second=0, microsecond=0)
+                end = target.set(hour=18, minute=30, second=0, microsecond=0)
             return start, end
-
-        # plain weekday mention (e.g., "Wednesday") → nearest future weekday
         if re.search(rf"\b{word}\b", p):
-            days_ahead_calc = (idx - now.weekday()) % 7
+            days_ahead_calc = (idx - now.day_of_week) % 7
             if days_ahead_calc == 0:
                 days_ahead_calc = 7
-            target = now + timedelta(days=days_ahead_calc)
-            start = target.replace(hour=9, minute=0, second=0, microsecond=0)
-            end = target.replace(hour=18, minute=30, second=0, microsecond=0)
+            target = now.add(days=days_ahead_calc)
+            start = target.set(hour=9, minute=0, second=0, microsecond=0)
+            end = target.set(hour=18, minute=30, second=0, microsecond=0)
             return start, end
 
-    # --- Handle explicit date with dateparser (tz-aware relative base + request tz-aware results) ---
+    # explicit date/time parsing attempt: look for yyyy-mm-dd or day-month patterns or "Nov 5" style via pendulum's parse
     try:
-        # Use a timezone-aware relative base (local tz) so dateparser resolves 'today/tonight' correctly
-        rel_base = now
-        sd = search_dates(
-            prompt or "",
-            settings={
-                "PREFER_DATES_FROM": "future",
-                "RELATIVE_BASE": rel_base,
-                "RETURN_AS_TIMEZONE_AWARE": True
-            }
-        )
-        if sd:
-            # pick the first meaningful match
-            matched_text, dt = sd[0]
-            if dt is None:
-                raise ValueError("dateparser returned None")
-            # If dateparser returned naive dt, interpret as local timezone (more intuitive)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=tz)
+        # pendulum.parse will attempt to parse natural strings; default to local tz
+        parsed = None
+        # try parse full prompt; if it returns a time in future it's acceptable
+        try:
+            parsed = pendulum.parse(p, tz=tz)
+        except Exception:
+            parsed = None
+        if parsed:
+            # if parsed looks date-only, produce work hours
+            if (parsed.hour == 0 and parsed.minute == 0) and not TIME_RE.search(p):
+                start = parsed.set(hour=9, minute=0, second=0, microsecond=0)
+                end = parsed.set(hour=18, minute=30, second=0, microsecond=0)
             else:
-                dt = dt.astimezone(tz)
-
-            # If user included an explicit time token, keep that time; otherwise treat as date-only -> set default work hours
-            has_time_token = bool(TIME_RE.search(p))
-            if (getattr(dt, "hour", 0) == 0 and getattr(dt, "minute", 0) == 0) and not has_time_token:
-                # date-only: use full work day
-                start = dt.replace(hour=9, minute=0, second=0, microsecond=0)
-                end = dt.replace(hour=18, minute=30, second=0, microsecond=0)
-            else:
-                # parsed datetime included a time — anchor window tightly around that time (allow some range)
-                start = dt.replace(second=0, microsecond=0)
-                # provide a reasonable end (workday end or +4h cap whichever smaller)
-                tentative_end = start + timedelta(hours=4)
-                workday_end = start.replace(hour=18, minute=30, second=0, microsecond=0)
+                start = parsed.set(second=0, microsecond=0)
+                tentative_end = start.add(hours=4)
+                workday_end = start.set(hour=18, minute=30, second=0, microsecond=0)
                 end = tentative_end if tentative_end <= workday_end else workday_end
-
-            # If the resulting start is in the past, adjust conservatively:
+            # if parsed date/time is in the past, move ahead to next sensible day
             if start <= now:
-                # If user explicitly asked for 'tomorrow' / weekday / 'next', move forward by 1 day
-                if "tomorrow" in p or any(w in p for w in ("next ", "next", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")):
-                    start = start + timedelta(days=1)
-                    if (getattr(start, "hour", 0) == 0 and getattr(start, "minute", 0) == 0):
-                        start = start.replace(hour=9, minute=0, second=0, microsecond=0)
-                    end = start.replace(hour=18, minute=30, second=0, microsecond=0)
-                else:
-                    # ambiguous case — pick a near-future time instead of jumping a whole day
-                    start = now + timedelta(minutes=15)
-                    end = (start + timedelta(hours=4)).replace(microsecond=0)
-                    # ensure we don't extend beyond today's work hours
-                    if end.hour > 18 or (end.hour == 18 and end.minute > 30):
-                        end = (now.replace(hour=18, minute=30, second=0, microsecond=0))
+                start = now.add(minutes=15)
+                end = start.add(hours=4)
             return start, end
     except Exception:
-        # fall through to default fallback
         pass
 
-    # --- Default fallback ---
-    start = (now + timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
-    end = start + timedelta(days=days_ahead)
+    # default fallback: tomorrow 09:00 to days_ahead window
+    start = now.add(days=1).set(hour=9, minute=0, second=0, microsecond=0)
+    end = start.add(days=days_ahead).set(hour=18, minute=30)
     return start, end
+
 
 # Book
 @app.post("/book")
