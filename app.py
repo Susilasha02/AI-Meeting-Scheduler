@@ -894,7 +894,7 @@ def contacts_list():
     return load_contacts()
 
 # NL → suggest (safer wrapper)
-@app.post("/nlp/suggest")
+'''@app.post("/nlp/suggest")
 def nlp_suggest(body: dict = Body(...)):
     try:
         creds = load_creds(ORGANIZER_ID)
@@ -907,7 +907,33 @@ def nlp_suggest(body: dict = Body(...)):
         return suggest(cfg)
     except Exception as e:
         logger.error("Exception in /nlp/suggest: %s\n%s", str(e), traceback.format_exc())
-        return JSONResponse({"error": "server_error", "detail": str(e), "trace": traceback.format_exc()}, status_code=500)
+        return JSONResponse({"error": "server_error", "detail": str(e), "trace": traceback.format_exc()}, status_code=500)'''
+@app.post("/nlp/suggest")
+def nlp_suggest(body: dict = Body(...)):
+    try:
+        # Defensive reload so we always run latest code while debugging
+        import importlib, sys
+        if "app" in sys.modules:
+            importlib.reload(sys.modules["app"])
+
+        # load parser directly and show where it comes from
+        from app import parse_prompt_to_window
+        print(">>> parse_prompt_to_window loaded from:", parse_prompt_to_window.__code__.co_filename)
+
+        prompt = (body.get("prompt","") or "").strip()
+        contacts_map = load_contacts()
+
+        # Call parser directly and show the returned config
+        cfg = parse_prompt_to_window(prompt, contacts_map)
+        print(">>> parse_prompt_to_window returned:", cfg)
+
+        cfg.setdefault("buffer_min", 15)
+        return suggest(cfg)
+
+    except Exception as e:
+        logger.exception("nlp_suggest debug exception")
+        return JSONResponse({"error":"server_error","detail":str(e)}, status_code=500)
+
 
 # Core suggest
 @app.post("/suggest")
