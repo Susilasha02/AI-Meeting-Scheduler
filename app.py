@@ -412,6 +412,12 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
         "window_start": ISO-with-local-offset,
         "window_end": ISO-with-local-offset
       }
+
+    This implementation:
+    - Prioritizes explicit weekday tokens ("next monday", "this tuesday", "wednesday")
+    - Handles explicit time tokens (2pm, 14:30) and fuzzy tokens (morning/afternoon/evening)
+    - Falls back to 'today'/'tomorrow'/'in X days'
+    - Uses pendulum timezones consistently
     """
     p = (prompt or "").strip()
     if contacts_map is None:
@@ -441,134 +447,90 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
     now_local = pendulum.now(tz_pd)
     plow = p.lower()
 
-    # 1) Try to parse entire prompt using pendulum (handles many cases like "tomorrow 3pm", "15 Oct 3pm")
+    # Helper to build a response dict from start (pendulum) and duration
+    def _resp_from_start(start_local: pendulum.DateTime):
+        # ensure seconds/microseconds normalized
+        start_local = start_local.set(second=0, microsecond=0)
+        # if start is still in the past, nudge forward (safety)
+        if start_local <= now_local:
+            start_local = now_local.add(minutes=15).set(second=0, microsecond=0)
+        end_local = start_local.add(minutes=duration_min)
+        return {
+            "attendees": sorted(attendees) if attendees else ["primary"],
+            "duration_min": duration_min,
+            "window_start": start_local.to_iso8601_string(),
+            "window_end": end_local.to_iso8601_string()
+        }
+
+    # 1) Explicit weekday handling (robust)
+    weekday_match = re.search(r"\b(?:(next|this)\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", plow)
+    if weekday_match:
+        prefix = (weekday_match.group(1) or "").strip()   # 'next' / 'this' / ''
+        weekday = weekday_match.group(2).lower()
+        target_idx = WEEKDAY_MAP[weekday]
+
+        # compute minimal positive days ahead (0..6)
+        days_ahead = (target_idx - now_local.day_of_week) % 7
+        # treat plain mention as nearest upcoming (if today, move to next week)
+        if days_ahead == 0:
+            days_ahead = 7
+
+        if prefix == "next":
+            # always the following week's weekday
+            days_ahead = days_ahead + 7 if days_ahead <= 7 else (days_ahead + 7)
+        elif prefix == "this":
+            # 'this monday' -> the one in the current week; if it's already passed, bump 7
+            # days_ahead currently 0..6 representing nearest; if the nearest is >6 then adjust
+            if (now_local.day_of_week > target_idx) or (days_ahead == 0 and now_local.hour > 23):
+                days_ahead = days_ahead + 7
+
+        target_date = now_local.add(days=days_ahead)
+        # apply time preferences (9am default if none provided)
+        start_local = _apply_time_preferences_pd(target_date, p)
+        # safety: if computed start <= now, push to next week
+        if start_local <= now_local:
+            start_local = start_local.add(weeks=1)
+        return _resp_from_start(start_local)
+
+    # 2) Try complete pendulum parse for expressions like "15 Oct 3pm" or "tomorrow 4pm"
     try:
         parsed = None
         try:
-            parsed = pendulum.parse(p, strict=False)
+            # allow pendulum to parse many natural forms
+            parsed = pendulum.parse(p, tz=tz_pd, strict=False)
         except Exception:
             parsed = None
 
         if parsed:
-            # If parse produced a timezone-aware object, first interpret it in parsed.tz, then move to LOCAL_TZ
-            parsed_local = parsed.in_timezone(tz_pd)
-            # If parsed_local is before now and appears to be "today", bump forward
-            if parsed_local <= now_local:
-                if "today" in plow or parsed_local.date() == now_local.date():
-                    parsed_local = parsed_local.add(days=1)
-                else:
-                    parsed_local = parsed_local.add(days=1)
-            # apply default time if user didn't give explicit time
+            # If parsed had only a date (00:00) and no explicit time token, apply preferences
             has_time = bool(TIME_RE.search(p))
+            parsed_local = parsed.in_timezone(tz_pd)
             if not has_time:
+                # set to morning/afternoon etc if mentioned, else default 09:00
                 parsed_local = _apply_time_preferences_pd(parsed_local.start_of("day"), p)
-            start_local = parsed_local
-            end_local = start_local.add(minutes=duration_min)
-            return {
-                "attendees": sorted(attendees) if attendees else ["primary"],
-                "duration_min": duration_min,
-                "window_start": start_local.to_iso8601_string(),
-                "window_end": end_local.to_iso8601_string()
-            }
+            # If parsed_local is before now_local and seems intended for future, nudge forward
+            if parsed_local <= now_local:
+                parsed_local = parsed_local.add(days=1)
+            return _resp_from_start(parsed_local)
     except Exception:
+        # ignore and continue to other heuristics
         pass
-        
-    '''#2) weekdays handling (next/this/plain)
-    m_next = NEXT_WEEKDAY_RE.search(p)
-    if m_next:
-        weekday = m_next.group(1).lower()
-        target = WEEKDAY_MAP[weekday]
-        # get next week's weekday
-        days_ahead = (target - now_local.weekday()) % 7
-        if days_ahead == 0:
-            days_ahead = 7
-        days_ahead += 7  # enforce next week
-        target_date = now_local.add(days=days_ahead)
-        start_local = _apply_time_preferences_pd(target_date, p)
-        if start_local <= now_local:
-            start_local = start_local.add(days=7)
-        end_local = start_local.add(minutes=duration_min)
-        return {
-            "attendees": sorted(attendees) if attendees else ["primary"],
-            "duration_min": duration_min,
-            "window_start": start_local.to_iso8601_string(),
-            "window_end": end_local.to_iso8601_string()
-        }
 
-    m_this = THIS_WEEKDAY_RE.search(p)
-    if m_this:
-        weekday = m_this.group(1).lower()
-        target = WEEKDAY_MAP[weekday]
-        days_ahead = (target - now_local.weekday()) % 7
-        if days_ahead == 0:
-            days_ahead = 7
-        target_date = now_local.add(days=days_ahead)
-        start_local = _apply_time_preferences_pd(target_date, p)
-        if start_local <= now_local:
-            start_local = start_local.add(days=7)
-        end_local = start_local.add(minutes=duration_min)
-        return {
-            "attendees": sorted(attendees) if attendees else ["primary"],
-            "duration_min": duration_min,
-            "window_start": start_local.to_iso8601_string(),
-            "window_end": end_local.to_iso8601_string()
-        }
-'''
-    #2 new weekday 
-        # --- Explicit weekday handling (fix) ---
-    weekday_match = re.search(r"\b(?:(next|this)\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", plow)
-    if weekday_match:
-        prefix = weekday_match.group(1) or ""   # 'next' / 'this' / ''
-        weekday = weekday_match.group(2).lower()
-        target_idx = WEEKDAY_MAP[weekday]
-
-        days_ahead = (target_idx - now_local.day_of_week) % 7
-        if days_ahead == 0:
-            days_ahead = 7  # avoid today
-
-        if prefix == "next":
-            days_ahead += 7  # push to the following week
-        elif prefix == "this" and days_ahead > 7:
-            days_ahead -= 7
-
-        target_date = now_local.add(days=days_ahead)
-        start_local = _apply_time_preferences_pd(target_date, p)
-        if start_local <= now_local:
-            start_local = start_local.add(weeks=1)
-        end_local = start_local.add(minutes=duration_min)
-        return {
-            "attendees": sorted(attendees) if attendees else ["primary"],
-            "duration_min": duration_min,
-            "window_start": start_local.to_iso8601_string(),
-            "window_end": end_local.to_iso8601_string()
-        }
-
-    # 3) shortcuts: today / tomorrow / in X days
+    # 3) Shortcuts: today / tomorrow / "in X days"
     if "today" in plow:
         candidate = now_local.add(minutes=15).replace(second=0, microsecond=0)
+        # avoid proposing late-night slots
         if candidate.hour >= 23:
             candidate = now_local.add(days=1).set(hour=9, minute=0, second=0)
-        start_local = candidate
-        end_local = start_local.add(minutes=duration_min)
-        return {
-            "attendees": sorted(attendees) if attendees else ["primary"],
-            "duration_min": duration_min,
-            "window_start": start_local.to_iso8601_string(),
-            "window_end": end_local.to_iso8601_string()
-        }
+        start_local = _apply_time_preferences_pd(candidate, p)
+        return _resp_from_start(start_local)
 
     if "tomorrow" in plow:
         candidate = now_local.add(days=1).set(hour=9, minute=0, second=0)
         start_local = _apply_time_preferences_pd(candidate, p)
         if start_local <= now_local:
             start_local = start_local.add(days=1)
-        end_local = start_local.add(minutes=duration_min)
-        return {
-            "attendees": sorted(attendees) if attendees else ["primary"],
-            "duration_min": duration_min,
-            "window_start": start_local.to_iso8601_string(),
-            "window_end": end_local.to_iso8601_string()
-        }
+        return _resp_from_start(start_local)
 
     m_in = re.search(r"in\s+(\d+)\s+day", plow)
     if m_in:
@@ -576,17 +538,19 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
         target = now_local.add(days=delta)
         start_local = target.set(hour=9, minute=0, second=0)
         start_local = _apply_time_preferences_pd(start_local, p)
-        end_local = start_local.add(minutes=duration_min)
-        return {
-            "attendees": sorted(attendees) if attendees else ["primary"],
-            "duration_min": duration_min,
-            "window_start": start_local.to_iso8601_string(),
-            "window_end": end_local.to_iso8601_string()
-        }
+        return _resp_from_start(start_local)
 
-    # 4) final fallback: rolling window next 1-5 days (work hours)
+    # 4) "next week" phrase -> start at next week's monday 09:00
+    if "next week" in plow:
+        # days until next week's Monday
+        days_until_monday = ((0 - now_local.day_of_week) % 7) or 7
+        start = now_local.add(days=days_until_monday + 7).set(hour=9, minute=0, second=0)
+        return _resp_from_start(start)
+
+    # 5) final fallback: rolling window next 1-5 days (work hours)
     fallback_start = now_local.add(days=1).set(hour=9, minute=0, second=0)
     fallback_end = fallback_start.add(days=4).set(hour=18, minute=30, second=0)
+    # return the window as start + full workday range (we'll let suggest() consume start/end)
     return {
         "attendees": sorted(attendees) if attendees else ["primary"],
         "duration_min": duration_min,
