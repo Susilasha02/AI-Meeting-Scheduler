@@ -472,8 +472,8 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
             }
     except Exception:
         pass
-
-    # 2) weekdays handling (next/this/plain)
+        
+    '''#2) weekdays handling (next/this/plain)
     m_next = NEXT_WEEKDAY_RE.search(p)
     if m_next:
         weekday = m_next.group(1).lower()
@@ -506,6 +506,35 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
         start_local = _apply_time_preferences_pd(target_date, p)
         if start_local <= now_local:
             start_local = start_local.add(days=7)
+        end_local = start_local.add(minutes=duration_min)
+        return {
+            "attendees": sorted(attendees) if attendees else ["primary"],
+            "duration_min": duration_min,
+            "window_start": start_local.to_iso8601_string(),
+            "window_end": end_local.to_iso8601_string()
+        }
+'''
+    #2 new weekday 
+        # --- Explicit weekday handling (fix) ---
+    weekday_match = re.search(r"\b(?:(next|this)\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", plow)
+    if weekday_match:
+        prefix = weekday_match.group(1) or ""   # 'next' / 'this' / ''
+        weekday = weekday_match.group(2).lower()
+        target_idx = WEEKDAY_MAP[weekday]
+
+        days_ahead = (target_idx - now_local.day_of_week) % 7
+        if days_ahead == 0:
+            days_ahead = 7  # avoid today
+
+        if prefix == "next":
+            days_ahead += 7  # push to the following week
+        elif prefix == "this" and days_ahead > 7:
+            days_ahead -= 7
+
+        target_date = now_local.add(days=days_ahead)
+        start_local = _apply_time_preferences_pd(target_date, p)
+        if start_local <= now_local:
+            start_local = start_local.add(weeks=1)
         end_local = start_local.add(minutes=duration_min)
         return {
             "attendees": sorted(attendees) if attendees else ["primary"],
