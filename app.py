@@ -203,24 +203,51 @@ def patch_event_description(creds: Credentials, calendar_id: str, event_id: str,
 
 # ---------- candidate builder + explanations ----------
 def _merge(intervals):
-    ivs = sorted([(datetime.fromisoformat(i["start"]), datetime.fromisoformat(i["end"])) for i in intervals])
-    out=[]
-    for s,e in ivs:
-        if not out or s>out[-1][1]:
-            out.append([s,e])
+    """
+    Merge list of intervals where each interval is a dict {"start": ISO, "end": ISO}
+    Use pendulum.parse to robustly handle offsets / tz-aware strings.
+    Returns list of (pendulum_datetime_start, pendulum_datetime_end).
+    """
+    ivs = []
+    for i in intervals:
+        # defensive: ensure string keys exist
+        try:
+            s = pendulum.parse(i["start"])
+            e = pendulum.parse(i["end"])
+            ivs.append((s, e))
+        except Exception:
+            continue
+    ivs.sort(key=lambda x: x[0])
+    out = []
+    for s, e in ivs:
+        if not out or s > out[-1][1]:
+            out.append([s, e])
         else:
             out[-1][1] = max(out[-1][1], e)
     return out
 
-def compute_free(busy_by_person, window_start: datetime, window_end: datetime):
-    all_busy=[b for person in busy_by_person for b in person]
-    merged=_merge(all_busy)
-    free=[]; cur=window_start
-    for s,e in merged:
-        if s>cur: free.append((cur,s))
-        cur=max(cur,e)
-    if cur<window_end: free.append((cur,window_end))
-    return [{"start":a.isoformat(), "end":b.isoformat()} for a,b in free]
+def compute_free(busy_by_person, window_start: pendulum.DateTime, window_end: pendulum.DateTime):
+    """
+    busy_by_person: list of lists of {"start": ISO, "end": ISO}
+    window_start/window_end: pendulum tz-aware datetimes
+    Returns: list of {"start": ISO_with_offset, "end": ISO_with_offset} using same tz as window_start
+    """
+    # flatten busy blocks
+    all_busy = [b for person in busy_by_person for b in person]
+    merged = _merge(all_busy)  # list of [pendulum_start, pendulum_end]
+    free = []
+    cur = window_start
+    for s, e in merged:
+        # normalize both s and e to window_start timezone for comparisons
+        s_local = s.in_timezone(window_start.timezone)
+        e_local = e.in_timezone(window_start.timezone)
+        if s_local > cur:
+            free.append((cur, s_local))
+        cur = max(cur, e_local)
+    if cur < window_end:
+        free.append((cur, window_end))
+    # return ISO strings (preserve tz offset)
+    return [{"start": a.to_iso8601_string(), "end": b.to_iso8601_string()} for a, b in free]
 
 def candidates(free_windows, duration_min=45, buffer_min=15, cap=3):
     out=[]; dur=timedelta(minutes=duration_min); buf=timedelta(minutes=buffer_min)
@@ -377,13 +404,13 @@ def _apply_time_preferences_pd(date_pd: pendulum.DateTime, prompt: str):
 
 def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_duration_min: int = 45):
     """
-    Pendulum-based parser returning offset-preserving ISO windows.
+    Pendulum-based parser returning offset-preserving ISO windows in LOCAL_TZ (not converted to UTC).
     Returns dict:
       {
         "attendees": [...],
         "duration_min": int,
-        "window_start": ISO-with-offset,
-        "window_end": ISO-with-offset
+        "window_start": ISO-with-local-offset,
+        "window_end": ISO-with-local-offset
       }
     """
     p = (prompt or "").strip()
@@ -416,42 +443,34 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
 
     # 1) Try to parse entire prompt using pendulum (handles many cases like "tomorrow 3pm", "15 Oct 3pm")
     try:
-        parsed = pendant = None
+        parsed = None
         try:
             parsed = pendulum.parse(p, strict=False)
         except Exception:
             parsed = None
 
         if parsed:
-            # Make into local timezone instance
+            # If parse produced a timezone-aware object, first interpret it in parsed.tz, then move to LOCAL_TZ
             parsed_local = parsed.in_timezone(tz_pd)
-            # If parsed_local is before now and user explicitly said "today", push forward to tomorrow
+            # If parsed_local is before now and appears to be "today", bump forward
             if parsed_local <= now_local:
-                # Only bump if it seems the user intended today (contains 'today') or if parsed date == today
                 if "today" in plow or parsed_local.date() == now_local.date():
                     parsed_local = parsed_local.add(days=1)
                 else:
-                    # If explicit future phrasing present, keep parsed_local (but if it's past, bump one day conservatively)
                     parsed_local = parsed_local.add(days=1)
-
-            # If no explicit time in prompt, apply preferences
+            # apply default time if user didn't give explicit time
             has_time = bool(TIME_RE.search(p))
             if not has_time:
                 parsed_local = _apply_time_preferences_pd(parsed_local.start_of("day"), p)
-
             start_local = parsed_local
             end_local = start_local.add(minutes=duration_min)
-            # convert to UTC for API but preserve timezone strings via helper
-            start_utc = start_local.in_timezone("UTC")
-            end_utc = end_local.in_timezone("UTC")
             return {
                 "attendees": sorted(attendees) if attendees else ["primary"],
                 "duration_min": duration_min,
-                "window_start": to_rfc3339_with_tz(start_utc),
-                "window_end": to_rfc3339_with_tz(end_utc)
+                "window_start": start_local.to_iso8601_string(),
+                "window_end": end_local.to_iso8601_string()
             }
     except Exception:
-        # fall back to subsequent heuristics
         pass
 
     # 2) weekdays handling (next/this/plain)
@@ -459,7 +478,7 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
     if m_next:
         weekday = m_next.group(1).lower()
         target = WEEKDAY_MAP[weekday]
-        # always the next week's weekday (at least +7 days)
+        # get next week's weekday
         days_ahead = (target - now_local.weekday()) % 7
         if days_ahead == 0:
             days_ahead = 7
@@ -468,13 +487,12 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
         start_local = _apply_time_preferences_pd(target_date, p)
         if start_local <= now_local:
             start_local = start_local.add(days=7)
-        start_utc = start_local.in_timezone("UTC")
-        end_utc = start_utc.add(minutes=duration_min)
+        end_local = start_local.add(minutes=duration_min)
         return {
             "attendees": sorted(attendees) if attendees else ["primary"],
             "duration_min": duration_min,
-            "window_start": to_rfc3339_with_tz(start_utc),
-            "window_end": to_rfc3339_with_tz(end_utc)
+            "window_start": start_local.to_iso8601_string(),
+            "window_end": end_local.to_iso8601_string()
         }
 
     m_this = THIS_WEEKDAY_RE.search(p)
@@ -483,37 +501,31 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
         target = WEEKDAY_MAP[weekday]
         days_ahead = (target - now_local.weekday()) % 7
         if days_ahead == 0:
-            # "this [weekday]" interpreted as next week if today passed
             days_ahead = 7
         target_date = now_local.add(days=days_ahead)
         start_local = _apply_time_preferences_pd(target_date, p)
         if start_local <= now_local:
             start_local = start_local.add(days=7)
-        start_utc = start_local.in_timezone("UTC")
-        end_utc = start_utc.add(minutes=duration_min)
+        end_local = start_local.add(minutes=duration_min)
         return {
             "attendees": sorted(attendees) if attendees else ["primary"],
             "duration_min": duration_min,
-            "window_start": to_rfc3339_with_tz(start_utc),
-            "window_end": to_rfc3339_with_tz(end_utc)
+            "window_start": start_local.to_iso8601_string(),
+            "window_end": end_local.to_iso8601_string()
         }
 
     # 3) shortcuts: today / tomorrow / in X days
     if "today" in plow:
-        # next available near now (15 minute buffer)
         candidate = now_local.add(minutes=15).replace(second=0, microsecond=0)
-        # if it's late-night push to next morning
         if candidate.hour >= 23:
             candidate = now_local.add(days=1).set(hour=9, minute=0, second=0)
         start_local = candidate
         end_local = start_local.add(minutes=duration_min)
-        start_utc = start_local.in_timezone("UTC")
-        end_utc = end_local.in_timezone("UTC")
         return {
             "attendees": sorted(attendees) if attendees else ["primary"],
             "duration_min": duration_min,
-            "window_start": to_rfc3339_with_tz(start_utc),
-            "window_end": to_rfc3339_with_tz(end_utc)
+            "window_start": start_local.to_iso8601_string(),
+            "window_end": end_local.to_iso8601_string()
         }
 
     if "tomorrow" in plow:
@@ -521,13 +533,12 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
         start_local = _apply_time_preferences_pd(candidate, p)
         if start_local <= now_local:
             start_local = start_local.add(days=1)
-        start_utc = start_local.in_timezone("UTC")
-        end_utc = start_utc.add(minutes=duration_min)
+        end_local = start_local.add(minutes=duration_min)
         return {
             "attendees": sorted(attendees) if attendees else ["primary"],
             "duration_min": duration_min,
-            "window_start": to_rfc3339_with_tz(start_utc),
-            "window_end": to_rfc3339_with_tz(end_utc)
+            "window_start": start_local.to_iso8601_string(),
+            "window_end": end_local.to_iso8601_string()
         }
 
     m_in = re.search(r"in\s+(\d+)\s+day", plow)
@@ -536,25 +547,22 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
         target = now_local.add(days=delta)
         start_local = target.set(hour=9, minute=0, second=0)
         start_local = _apply_time_preferences_pd(start_local, p)
-        start_utc = start_local.in_timezone("UTC")
-        end_utc = start_utc.add(minutes=duration_min)
+        end_local = start_local.add(minutes=duration_min)
         return {
             "attendees": sorted(attendees) if attendees else ["primary"],
             "duration_min": duration_min,
-            "window_start": to_rfc3339_with_tz(start_utc),
-            "window_end": to_rfc3339_with_tz(end_utc)
+            "window_start": start_local.to_iso8601_string(),
+            "window_end": end_local.to_iso8601_string()
         }
 
     # 4) final fallback: rolling window next 1-5 days (work hours)
     fallback_start = now_local.add(days=1).set(hour=9, minute=0, second=0)
-    fallback_end = fallback_start.add(days=min(5,  days_ahead if (days_ahead := 5) else 5)).set(hour=18, minute=30)
-    start_utc = fallback_start.in_timezone("UTC")
-    end_utc = fallback_end.in_timezone("UTC")
+    fallback_end = fallback_start.add(days=4).set(hour=18, minute=30, second=0)
     return {
         "attendees": sorted(attendees) if attendees else ["primary"],
         "duration_min": duration_min,
-        "window_start": to_rfc3339_with_tz(start_utc),
-        "window_end": to_rfc3339_with_tz(end_utc)
+        "window_start": fallback_start.to_iso8601_string(),
+        "window_end": fallback_end.to_iso8601_string()
     }
 
 # Wrapper parse_prompt to produce the config suggest() expects
@@ -922,32 +930,33 @@ def suggest(body: dict = Body(default={})):
 
         # Use pendulum for robust tz-aware parsing
         if start_iso and end_iso:
+            # parse the incoming window (we expect parse_prompt_to_window to give LOCAL_TZ offsets)
             start_pd = pendulum.parse(start_iso)
             end_pd = pendulum.parse(end_iso)
-            start = start_pd
-            end = end_pd
+            # normalize to LOCAL_TZ for internal computations and logging
+            try:
+                start = start_pd.in_timezone(LOCAL_TZ)
+                end = end_pd.in_timezone(LOCAL_TZ)
+            except Exception:
+                start = start_pd
+                end = end_pd
         else:
-            # ⚙️ FIX: respect window_start/window_end passed by /nlp/suggest
-            # Do not recompute from prompt again.
-            logger.info("Using window_start/window_end from incoming request instead of recomputing.")
-            if body.get("window_start") and body.get("window_end"):
-                start = pendulum.parse(body["window_start"])
-                end = pendulum.parse(body["window_end"])
-            else:
-                now = pendulum.now("UTC")
-                start = now.add(days=1).set(hour=9, minute=0, second=0)
-                end = now.add(days=5).set(hour=18, minute=30, second=0)
+            # No explicit window provided — provide default local rolling window
+            tz_local = pendulum.timezone(LOCAL_TZ)
+            now_local = pendulum.now(tz_local)
+            start = now_local.add(days=1).set(hour=9, minute=0, second=0)
+            end = now_local.add(days=5).set(hour=18, minute=30, second=0)
 
-        # Prepare ISO strings with explicit UTC offset for freebusy call
-        start_iso_for_api = to_rfc3339_with_tz(pendulum.instance(start).in_timezone("UTC"))
-        end_iso_for_api = to_rfc3339_with_tz(pendulum.instance(end).in_timezone("UTC"))
+        # For Google API we need UTC ISO strings. Convert here (preserve offset info using pendulum)
+        start_iso_for_api = pendulum.instance(start).in_timezone("UTC").to_iso8601_string()
+        end_iso_for_api = pendulum.instance(end).in_timezone("UTC").to_iso8601_string()
 
-        logger.info("suggest: attendees=%s start=%s end=%s prompt=%s",
-                    attendees, start_iso_for_api, end_iso_for_api, prompt_text)
-        logger.info("FINAL search window (local): %s → %s", start, end)
+        # Logging: show the window in LOCAL_TZ so developer logs match UI
+        logger.info("suggest: attendees=%s start(local)=%s end(local)=%s prompt=%s",
+                    attendees, start.to_iso8601_string(), end.to_iso8601_string(), prompt_text)
+        logger.info("FINAL search window (local): %s → %s", start.to_iso8601_string(), end.to_iso8601_string())
 
-
-        # call freebusy (it expects RFC3339 strings)
+        # call freebusy (it expects RFC3339 strings in UTC)
         fb = freebusy(creds, attendees, start_iso_for_api, end_iso_for_api)
 
         # busy_lists: keep the raw ISO strings returned by Google (they include offsets)
