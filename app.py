@@ -338,7 +338,8 @@ DUR_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(hours|hour|hrs|hr|h|minutes|min|mins|
 NEXT_WEEKDAY_RE = re.compile(r"\bnext\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", re.I)
 THIS_WEEKDAY_RE = re.compile(r"\bthis\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", re.I)
 WEEKDAY_RE = re.compile(r"\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", re.I)
-TIME_RE = re.compile(r"\b(\d{1,2}(:\d{2})?\s*(?:am|pm|AM|PM)?)\b")
+TIME_RE = re.compile(r"\b(\d{1,2}:\d{2}\s*(?:am|pm)?|\d{1,2}\s*(?:am|pm))\b", re.I)
+
 
 WEEKDAY_MAP = {
     "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
@@ -370,26 +371,18 @@ def _next_weekday_after(base_date: datetime, weekday_index: int, at_least_one_we
         days_ahead += 7
     return base_date + timedelta(days=days_ahead)
 
-# ---------- earlier regex helpers (replace TIME_RE and parse_time_token) ----------
-# require either colon (e.g. 14:30) or explicitly an am/pm marker to consider it a time.
-# This prevents duration tokens like "30 min" matching as times.
-TIME_RE = re.compile(r"\b(\d{1,2}:\d{2}\s*(?:am|pm)?|\d{1,2}\s*(?:am|pm))\b", re.I)
-
+    
 def parse_time_token(time_text: str):
     """
-    Parse '2pm', '14:30', '2:15 pm' deterministically. Returns (hour, minute) or (None, None).
-
-    IMPORTANT: this will NOT treat plain numbers like '30' (duration) as times
-    because TIME_RE won't match them anymore. Also, do an extra defensive check
-    to ensure the matched token isn't actually part of a duration ('30 min').
+    Parse '2pm', '14:30', '2:15 pm' safely.
+    Returns (hour, minute) or (None, None).
+    This version ignores plain numbers like '30' that may appear in '30 min'.
     """
     if not time_text:
         return None, None
 
-    # Defensive: ensure token is not immediately followed by 'min' / 'mins' in the original prompt context.
-    # Caller should pass the whole prompt if needed; but we also perform a local check if user passed e.g. "30 min".
-    # If it's something like "30 min", caller's TIME_RE won't have matched. This is an extra guard.
-    if re.search(r"\b" + re.escape(time_text) + r"\b\s*(?:min|mins|minutes)\b", time_text, re.I):
+    # Ignore if token is followed by 'min' or 'mins' etc.
+    if re.search(r"\b\d+\s*(?:min|mins|minutes)\b", time_text, re.I):
         return None, None
 
     m = re.match(r"^\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*$", time_text, re.I)
@@ -403,12 +396,7 @@ def parse_time_token(time_text: str):
             hour = 0
         if 0 <= hour < 24 and 0 <= minute < 60:
             return hour, minute
-    # fallback to pendulum parsing (less strict) only if explicit markers present
-    try:
-        p = pendulum.parse(time_text, strict=False)
-        return p.hour, p.minute
-    except Exception:
-        return None, None
+    return None, None
 
 
 
