@@ -1176,19 +1176,27 @@ def suggest(body: dict = Body(default={})):
                     end_with_buffer = req_end_utc.add(minutes=buffer_min)
 
                     if not overlaps_busy(start_with_buffer, end_with_buffer):
+                        # build a canonical candidate entry (UTC times) — matches raw_candidates format exactly
                         requested_candidate = {
                             "slot": {
                                 "start": req_utc.to_iso8601_string(),
                                 "end": req_end_utc.to_iso8601_string(),
+                                # meta lives inside slot like other candidates do
                                 "meta": {"buffers": {"pre": buffer_min, "post": buffer_min}}
                             },
+                            # older code expects some fields at top-level too — duplicate them for compatibility
                             "start": req_utc.to_iso8601_string(),
                             "end": req_end_utc.to_iso8601_string(),
+                            # also duplicate meta at top-level so explain() or other code that treats candidate as slot won't fail
+                            "meta": {"buffers": {"pre": buffer_min, "post": buffer_min}},
+                            # human-friendly label
                             "human": f"{req_local.format('ddd, DD MMM YYYY hh:mm A')} → {req_local.add(minutes=duration_min).format('hh:mm A')} ({LOCAL_TZ})",
+                            # compatibility: some code expects "explain" or "explanation" — include both lightly
                             "explain": {"conflict_free": True, "reason": "requested_start_available"},
+                            "explanation": {"conflict_free": True, "reason": "requested_start_available"},
+                            # score top so it appears first
                             "score": 1.0
                         }
-
                         # avoid duplicate if same UTC start already exists
                         existing_start_times = {c["start"] for c in raw_candidates}
                         if req_utc.to_iso8601_string() not in existing_start_times:
