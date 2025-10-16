@@ -253,21 +253,48 @@ def compute_free(busy_by_person, window_start: pendulum.DateTime, window_end: pe
     # return ISO strings (preserve tz offset)
     return [{"start": a.to_iso8601_string(), "end": b.to_iso8601_string()} for a, b in free]
 
-def candidates(free_windows, duration_min=45, buffer_min=15, cap=3):
-    out=[]; dur=timedelta(minutes=duration_min); buf=timedelta(minutes=buffer_min)
-    daily={}
+def candidates(free_windows, duration_min=45, buffer_min=15, cap=6, step_min=15):
+    """
+    Generate candidate meeting slots from free windows.
+
+    - step_min: how far the sliding window advances each iteration (smaller -> more candidates)
+    - cap: max slots per day (increase to get more options across the day)
+    - buffer_min: pre/post buffer enforced around meetings
+
+    Returns up to 50 slots by default (trimmed at end).
+    """
+    out = []
+    dur = timedelta(minutes=duration_min)
+    buf = timedelta(minutes=buffer_min)
+    daily = {}
+
+    # iterate each free window and produce sliding slots with small steps
     for w in free_windows:
-        s = datetime.fromisoformat(w["start"]) + buf
-        e = datetime.fromisoformat(w["end"]) - buf
-        cur=s
-        while cur+dur<=e:
-            day=cur.date()
-            if daily.get(day,0)<cap:
-                out.append({"start":cur.isoformat(), "end":(cur+dur).isoformat(),
-                            "meta":{"buffers":{"pre":buffer_min,"post":buffer_min}}})
-                daily[day]=daily.get(day,0)+1
-            cur += dur
-    return out[:10]
+        s = pendulum.parse(w["start"])
+        e = pendulum.parse(w["end"])
+        # enforce buffers
+        s = s.add(minutes=buffer_min)
+        e = e.subtract(minutes=buffer_min)
+        if s >= e:
+            continue
+
+        cur = s
+        step = timedelta(minutes=step_min)
+        while cur + dur <= e:
+            day = cur.date()
+            day_count = daily.get(day, 0)
+            if day_count < cap:
+                out.append({
+                    "start": cur.to_iso8601_string(),
+                    "end": (cur + dur).to_iso8601_string(),
+                    "meta": {"buffers": {"pre": buffer_min, "post": buffer_min}}
+                })
+                daily[day] = day_count + 1
+            cur = cur + step
+
+    # cap global results
+    return out[:50]
+
 
 def explain(slot):
     b=slot["meta"]["buffers"]
@@ -408,8 +435,18 @@ def _apply_time_preferences_pd(date_pd: pendulum.DateTime, prompt: str):
 
 def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_duration_min: int = 45):
     """
-    Instrumented robust parser: logs normalized prompt, cleaned_for_weekday, TIME_RE matches and branch chosen.
-    Returns the same dict shape as before.
+    Pendulum-aware parser returning offset-preserving ISO windows.
+    Returns dict:
+      {
+        "attendees": [...],
+        "duration_min": int,
+        "window_start": ISO-with-offset,
+        "window_end": ISO-with-offset
+      }
+    Improvements:
+      - robust weekday handling for "next/this/plain weekday"
+      - consistent use of pendulum timezone-aware datetimes
+      - normalization of common misspellings
     """
     p_raw = (prompt or "").strip()
     p = p_raw or ""
@@ -474,11 +511,13 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
 
     def _resp_from_start(start_local: pendulum.DateTime, branch_name: str = "unknown"):
         start_local = start_local.set(second=0, microsecond=0)
+        # ensure future
         if start_local <= now_local:
             start_local = now_local.add(minutes=15).set(second=0, microsecond=0)
         end_local = start_local.add(minutes=duration_min)
         # log branch info
-        logger.info("parse_prompt_to_window CHOSEN: branch=%s start=%s end=%s", branch_name, start_local.to_iso8601_string(), end_local.to_iso8601_string())
+        logger.info("parse_prompt_to_window CHOSEN: branch=%s start=%s end=%s",
+                    branch_name, start_local.to_iso8601_string(), end_local.to_iso8601_string())
         return {
             "attendees": sorted(attendees) if attendees else ["primary"],
             "duration_min": duration_min,
@@ -499,18 +538,48 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
             base = _apply_time_preferences_pd(base, p)
         return _resp_from_start(base, "tomorrow")
 
-    # 2) weekday detection on cleaned text
-    wd = re.search(r"\b(?:(next|this)\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", cleaned_for_weekday)
+    # 2) weekday detection on cleaned text (robust "next/this/plain" handling)
+    wd = re.search(r"\b(?:(next|this)\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+                   cleaned_for_weekday, flags=re.I)
     if wd:
-        prefix = (wd.group(1) or "").lower()
+        prefix = (wd.group(1) or "").lower().strip()
         weekday_name = wd.group(2).lower()
-        idx = WEEKDAY_MAP[weekday_name]
-        days_ahead = (idx - now_local.day_of_week) % 7
-        if not prefix and days_ahead == 0:
-            days_ahead = 7
-        if prefix == "next":
-            days_ahead = days_ahead + 7 if days_ahead <= 7 else days_ahead + 7
+        idx = WEEKDAY_MAP[weekday_name]  # 0..6, Monday=0
+
+        today_idx = int(now_local.day_of_week)  # pendulum: Monday=0
+        base_days = (idx - today_idx) % 7  # 0..6
+
+        # Interpret plain mention: nearest future (if same day -> next week)
+        if prefix == "":
+            days_ahead = base_days if base_days != 0 else 7
+        elif prefix == "this":
+            # prefer this week's occurrence; if same-day but time already passed, bump a week
+            days_ahead = base_days
+            if days_ahead == 0:
+                # determine intended time to see if it's already passed
+                tm = TIME_RE.search(p) or TIME_RE.search(plow)
+                if tm:
+                    h, m = parse_time_token(tm.group(1))
+                    h = 9 if h is None else h
+                    m = 0 if m is None else m
+                    candidate = now_local.set(hour=h, minute=m, second=0, microsecond=0)
+                else:
+                    candidate = _apply_time_preferences_pd(now_local.start_of("day"), p)
+                if candidate <= now_local:
+                    days_ahead = 7
+        else:  # prefix == "next"
+            # force at least one week ahead
+            days_ahead = base_days + 7 if base_days < 7 else base_days
+            if days_ahead == 0:
+                days_ahead = 7
+
+        # safety clamp
+        if days_ahead < 0:
+            days_ahead = 0
+
         target = now_local.add(days=days_ahead)
+
+        # respect explicit time token in original prompt if present
         tm = TIME_RE.search(p) or TIME_RE.search(plow)
         if tm:
             hour, minute = parse_time_token(tm.group(1))
@@ -519,11 +588,14 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
             target = target.set(hour=hour, minute=minute, second=0, microsecond=0)
         else:
             target = _apply_time_preferences_pd(target, p)
+
+        # final safety: if still in past, bump by one week
         if target <= now_local:
-            target = target.add(weeks=1)
+            target = target.add(days=7)
+
         return _resp_from_start(target, f"weekday({weekday_name},prefix={prefix})")
 
-    # 3) explicit pendulum parse
+    # 3) explicit pendulum parse (dates like "15 Oct 3pm", "Nov 5 2pm")
     try:
         parsed = None
         try:
@@ -571,15 +643,14 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
     # fallback
     fallback_start = now_local.add(days=1).set(hour=9, minute=0, second=0)
     fallback_end = fallback_start.add(days=4).set(hour=18, minute=30, second=0)
-    logger.info("parse_prompt_to_window CHOSEN: branch=fallback start=%s end=%s prompt=%s", fallback_start.to_iso8601_string(), fallback_end.to_iso8601_string(), p_raw)
+    logger.info("parse_prompt_to_window CHOSEN: branch=fallback start=%s end=%s prompt=%s",
+                fallback_start.to_iso8601_string(), fallback_end.to_iso8601_string(), p_raw)
     return {
         "attendees": sorted(attendees) if attendees else ["primary"],
         "duration_min": duration_min,
         "window_start": fallback_start.to_iso8601_string(),
         "window_end": fallback_end.to_iso8601_string()
     }
-
-
 # Wrapper parse_prompt to produce the config suggest() expects
 def parse_prompt(prompt: str, contacts_map: Dict[str, str] = None) -> Dict:
     """
