@@ -436,17 +436,9 @@ def _apply_time_preferences_pd(date_pd: pendulum.DateTime, prompt: str):
 def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_duration_min: int = 45):
     """
     Pendulum-aware parser returning offset-preserving ISO windows.
-    Returns dict:
-      {
-        "attendees": [...],
-        "duration_min": int,
-        "window_start": ISO-with-offset,
-        "window_end": ISO-with-offset
-      }
-    Improvements:
-      - robust weekday handling for "next/this/plain weekday"
-      - consistent use of pendulum timezone-aware datetimes
-      - normalization of common misspellings
+    Now returns additional keys:
+      - explicit_time: True/False (True if a concrete time token was present)
+      - requested_start: ISO-with-offset (the exact requested start when explicit_time=True)
     """
     p_raw = (prompt or "").strip()
     p = p_raw or ""
@@ -509,21 +501,27 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
     logger.info("parse_prompt_to_window DEBUG: cleaned_for_weekday=%r", cleaned_for_weekday)
     logger.info("parse_prompt_to_window DEBUG: TIME_RE match (orig/plow/cleaned)=%r", bool(time_token_match))
 
-    def _resp_from_start(start_local: pendulum.DateTime, branch_name: str = "unknown"):
+    def _resp_from_start(start_local: pendulum.DateTime, branch_name: str = "unknown", explicit_time: bool = False):
         start_local = start_local.set(second=0, microsecond=0)
-        # ensure future
         if start_local <= now_local:
+            # small nudge into the future to avoid past starts
             start_local = now_local.add(minutes=15).set(second=0, microsecond=0)
         end_local = start_local.add(minutes=duration_min)
-        # log branch info
-        logger.info("parse_prompt_to_window CHOSEN: branch=%s start=%s end=%s",
-                    branch_name, start_local.to_iso8601_string(), end_local.to_iso8601_string())
-        return {
+        logger.info("parse_prompt_to_window CHOSEN: branch=%s start=%s end=%s explicit_time=%s",
+                    branch_name, start_local.to_iso8601_string(), end_local.to_iso8601_string(), explicit_time)
+        resp = {
             "attendees": sorted(attendees) if attendees else ["primary"],
             "duration_min": duration_min,
             "window_start": start_local.to_iso8601_string(),
             "window_end": end_local.to_iso8601_string()
         }
+        if explicit_time:
+            resp["explicit_time"] = True
+            resp["requested_start"] = start_local.to_iso8601_string()
+        else:
+            resp["explicit_time"] = False
+            resp["requested_start"] = None
+        return resp
 
     # 1) tomorrow
     if "tomorrow" in plow:
@@ -534,32 +532,28 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
             hour = 9 if hour is None else hour
             minute = 0 if minute is None else minute
             base = base.set(hour=hour, minute=minute, second=0, microsecond=0)
+            return _resp_from_start(base, "tomorrow", explicit_time=True)
         else:
             base = _apply_time_preferences_pd(base, p)
-        return _resp_from_start(base, "tomorrow")
+            return _resp_from_start(base, "tomorrow", explicit_time=False)
 
-    # 2) weekday detection on cleaned text (robust "next/this/plain" handling)
-    wd = re.search(r"\b(?:(next|this)\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
-                   cleaned_for_weekday, flags=re.I)
+    # 2) weekday detection on cleaned text
+    wd = re.search(r"\b(?:(next|this)\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", cleaned_for_weekday, flags=re.I)
     if wd:
         prefix = (wd.group(1) or "").lower().strip()
         weekday_name = wd.group(2).lower()
-        idx = WEEKDAY_MAP[weekday_name]  # 0..6, Monday=0
+        idx = WEEKDAY_MAP[weekday_name]  # 0..6
+        today_idx = int(now_local.day_of_week)
+        base_days = (idx - today_idx) % 7
 
-        today_idx = int(now_local.day_of_week)  # pendulum: Monday=0
-        base_days = (idx - today_idx) % 7  # 0..6
-
-        # Interpret plain mention: nearest future (if same day -> next week)
         if prefix == "":
             days_ahead = base_days if base_days != 0 else 7
         elif prefix == "this":
-            # prefer this week's occurrence; if same-day but time already passed, bump a week
             days_ahead = base_days
             if days_ahead == 0:
-                # determine intended time to see if it's already passed
-                tm = TIME_RE.search(p) or TIME_RE.search(plow)
-                if tm:
-                    h, m = parse_time_token(tm.group(1))
+                tm2 = TIME_RE.search(p) or TIME_RE.search(plow)
+                if tm2:
+                    h, m = parse_time_token(tm2.group(1))
                     h = 9 if h is None else h
                     m = 0 if m is None else m
                     candidate = now_local.set(hour=h, minute=m, second=0, microsecond=0)
@@ -568,34 +562,29 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
                 if candidate <= now_local:
                     days_ahead = 7
         else:  # prefix == "next"
-            # force at least one week ahead
             days_ahead = base_days + 7 if base_days < 7 else base_days
             if days_ahead == 0:
                 days_ahead = 7
 
-        # safety clamp
         if days_ahead < 0:
             days_ahead = 0
 
         target = now_local.add(days=days_ahead)
 
-        # respect explicit time token in original prompt if present
         tm = TIME_RE.search(p) or TIME_RE.search(plow)
         if tm:
             hour, minute = parse_time_token(tm.group(1))
             hour = 9 if hour is None else hour
             minute = 0 if minute is None else minute
             target = target.set(hour=hour, minute=minute, second=0, microsecond=0)
+            return _resp_from_start(target, f"weekday({weekday_name},prefix={prefix})", explicit_time=True)
         else:
             target = _apply_time_preferences_pd(target, p)
+            if target <= now_local:
+                target = target.add(days=7)
+            return _resp_from_start(target, f"weekday({weekday_name},prefix={prefix})", explicit_time=False)
 
-        # final safety: if still in past, bump by one week
-        if target <= now_local:
-            target = target.add(days=7)
-
-        return _resp_from_start(target, f"weekday({weekday_name},prefix={prefix})")
-
-    # 3) explicit pendulum parse (dates like "15 Oct 3pm", "Nov 5 2pm")
+    # 3) explicit pendulum parse
     try:
         parsed = None
         try:
@@ -607,9 +596,11 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
             has_time = bool(TIME_RE.search(p) or TIME_RE.search(plow))
             if not has_time:
                 parsed_local = _apply_time_preferences_pd(parsed_local.start_of("day"), p)
-            if parsed_local <= now_local:
-                parsed_local = parsed_local.add(days=1)
-            return _resp_from_start(parsed_local, "pendulum_parse")
+                return _resp_from_start(parsed_local, "pendulum_parse", explicit_time=False)
+            else:
+                if parsed_local <= now_local:
+                    parsed_local = parsed_local.add(days=1)
+                return _resp_from_start(parsed_local, "pendulum_parse", explicit_time=True)
     except Exception:
         pass
 
@@ -622,9 +613,10 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
             hour = 9 if hour is None else hour
             minute = 0 if minute is None else minute
             base = base.set(hour=hour, minute=minute, second=0, microsecond=0)
+            return _resp_from_start(base, "today", explicit_time=True)
         else:
             base = _apply_time_preferences_pd(base, p)
-        return _resp_from_start(base, "today")
+            return _resp_from_start(base, "today", explicit_time=False)
 
     # 5) in X days
     m_in = re.search(r"in\s+(\d+)\s+day", plow)
@@ -632,13 +624,13 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
         delta = int(m_in.group(1))
         target = now_local.add(days=delta)
         target = _apply_time_preferences_pd(target.set(hour=9, minute=0), p)
-        return _resp_from_start(target, f"in_{delta}_days")
+        return _resp_from_start(target, f"in_{delta}_days", explicit_time=False)
 
     # 6) next week
     if "next week" in plow:
         days_until_monday = ((0 - now_local.day_of_week) % 7) or 7
         start = now_local.add(days=days_until_monday + 7).set(hour=9, minute=0, second=0)
-        return _resp_from_start(start, "next_week")
+        return _resp_from_start(start, "next_week", explicit_time=False)
 
     # fallback
     fallback_start = now_local.add(days=1).set(hour=9, minute=0, second=0)
@@ -649,7 +641,9 @@ def parse_prompt_to_window(prompt: str, contacts_map: dict = None, default_durat
         "attendees": sorted(attendees) if attendees else ["primary"],
         "duration_min": duration_min,
         "window_start": fallback_start.to_iso8601_string(),
-        "window_end": fallback_end.to_iso8601_string()
+        "window_end": fallback_end.to_iso8601_string(),
+        "explicit_time": False,
+        "requested_start": None
     }
 # Wrapper parse_prompt to produce the config suggest() expects
 def parse_prompt(prompt: str, contacts_map: Dict[str, str] = None) -> Dict:
@@ -1015,24 +1009,42 @@ def nlp_suggest(body: dict = Body(...)):
         return JSONResponse({"error": "server_error", "detail": str(e), "trace": traceback.format_exc()}, status_code=500)'''
 @app.post("/nlp/suggest")
 def nlp_suggest(body: dict = Body(...)):
+    """
+    Debugging-wrapper around the normal suggest flow that defensively reloads parser
+    and enforces strict behavior when an explicit time was present in the user's prompt.
+    """
     try:
-        # Defensive reload so we always run latest code while debugging
         import importlib, sys
         if "app" in sys.modules:
             importlib.reload(sys.modules["app"])
 
-        # load parser directly and show where it comes from
-        from app import parse_prompt_to_window
-        print(">>> parse_prompt_to_window loaded from:", parse_prompt_to_window.__code__.co_filename)
-
+        from app import parse_prompt_to_window  # noqa: E402
         prompt = (body.get("prompt","") or "").strip()
         contacts_map = load_contacts()
 
-        # Call parser directly and show the returned config
         cfg = parse_prompt_to_window(prompt, contacts_map)
-        print(">>> parse_prompt_to_window returned:", cfg)
+        logger.info("nlp_suggest: parser returned: %s", cfg)
+
+        # If user asked for an explicit time (e.g. "tomorrow 3pm") we tighten the window
+        # so empty calendars still propose slots at/near the requested time.
+        if cfg.get("explicit_time") and cfg.get("requested_start"):
+            # requested_start is ISO with offset in user's local tz; parse into pendulum
+            try:
+                req_pd = pendulum.parse(cfg["requested_start"])
+                # keep the provided start as the lower bound
+                window_start_pd = req_pd
+                # set a small upper bound: requested_start + 3 hours (adjustable)
+                window_end_pd = req_pd.add(hours=3)
+                cfg["window_start"] = window_start_pd.to_iso8601_string()
+                cfg["window_end"] = window_end_pd.to_iso8601_string()
+                logger.info("nlp_suggest: tightened window around requested_time: %s -> %s",
+                            cfg["window_start"], cfg["window_end"])
+            except Exception:
+                # if parse fails, keep parser window as-is (defensive)
+                logger.exception("nlp_suggest: failed to parse requested_start; using original window")
 
         cfg.setdefault("buffer_min", 15)
+        # call core suggest (body-shaped config)
         return suggest(cfg)
 
     except Exception as e:
@@ -1040,7 +1052,7 @@ def nlp_suggest(body: dict = Body(...)):
         return JSONResponse({"error":"server_error","detail":str(e)}, status_code=500)
 
 
-# Core suggest
+## ------------------ Updated /suggest endpoint (drop-in replacement) ------------------
 @app.post("/suggest")
 def suggest(body: dict = Body(default={})):
     """
@@ -1049,33 +1061,57 @@ def suggest(body: dict = Body(default={})):
       - attendees: list of emails (or ["primary"])
       - window_start / window_end (RFC3339)
       - OR: prompt and today_only: true/false
+      - optionally: explicit_time (bool) and requested_start (ISO string) to request strict behavior
+    Behavior:
+      - If explicit_time + requested_start present, prefer slots near requested_start (STRICT window).
+      - If prompt provided and no explicit window, parse it with parse_prompt_to_window() to derive window/flags.
     """
     creds = load_creds(ORGANIZER_ID)
     if not creds:
         return JSONResponse({"error": "not_connected"}, status_code=401)
 
     try:
-        # duration / buffer
+        # ---------------- basic inputs ----------------
         duration_min = int(body.get("duration_min", 45))
-        buffer_min   = int(body.get("buffer_min", 15))
+        buffer_min = int(body.get("buffer_min", 15))
 
         attendees_raw = body.get("attendees", ["primary"])
         attendees = [a for a in attendees_raw if a == "primary" or "@" in a]
         if not attendees:
             attendees = ["primary"]
 
-        # compute window: either explicit window OR derived from prompt + today_only
-        start_iso = body.get("window_start")
-        end_iso   = body.get("window_end")
-        prompt_text = body.get("prompt", "")
+        prompt_text = (body.get("prompt", "") or "").strip()
         today_only_flag = bool(body.get("today_only", False))
 
-        # Use pendulum for robust tz-aware parsing
+        # ---------------- derive window: prefer explicit window_start/window_end ----------------
+        start_iso = body.get("window_start")
+        end_iso = body.get("window_end")
+
+        # If caller didn't supply explicit window, but supplied prompt, use the parser to derive window + flags
+        explicit_flag = bool(body.get("explicit_time", False))
+        requested_start_iso = body.get("requested_start")  # may be None
+
+        if (not start_iso or not end_iso) and prompt_text:
+            # call parser to derive window and possibly explicit_time/requested_start
+            try:
+                parsed_cfg = parse_prompt_to_window(prompt_text, load_contacts(), default_duration_min=duration_min)
+                # parser returns window_start/window_end in local tz ISO and explicit_time/requested_start flags
+                start_iso = start_iso or parsed_cfg.get("window_start")
+                end_iso = end_iso or parsed_cfg.get("window_end")
+                # only override explicit flags if not present in body
+                if "explicit_time" not in body:
+                    explicit_flag = bool(parsed_cfg.get("explicit_time", False))
+                if "requested_start" not in body:
+                    requested_start_iso = parsed_cfg.get("requested_start")
+                logger.info("suggest: parse_prompt_to_window produced explicit_time=%s requested_start=%s window=%s->%s",
+                            explicit_flag, requested_start_iso, start_iso, end_iso)
+            except Exception:
+                logger.exception("suggest: parse_prompt_to_window failed; falling back to defaults")
+
+        # If still no explicit start/end, compute default rolling window (local tz)
         if start_iso and end_iso:
-            # parse the incoming window (we expect parse_prompt_to_window to give LOCAL_TZ offsets)
             start_pd = pendulum.parse(start_iso)
             end_pd = pendulum.parse(end_iso)
-            # normalize to LOCAL_TZ for internal computations and logging
             try:
                 start = start_pd.in_timezone(LOCAL_TZ)
                 end = end_pd.in_timezone(LOCAL_TZ)
@@ -1083,64 +1119,90 @@ def suggest(body: dict = Body(default={})):
                 start = start_pd
                 end = end_pd
         else:
-            # No explicit window provided — provide default local rolling window
             tz_local = pendulum.timezone(LOCAL_TZ)
             now_local = pendulum.now(tz_local)
             start = now_local.add(days=1).set(hour=9, minute=0, second=0)
             end = now_local.add(days=5).set(hour=18, minute=30, second=0)
+            start_iso = start.to_iso8601_string()
+            end_iso = end.to_iso8601_string()
 
-        # For Google API we need UTC ISO strings. Convert here (preserve offset info using pendulum)
+        # prepare UTC strings for Google freebusy
         start_iso_for_api = pendulum.instance(start).in_timezone("UTC").to_iso8601_string()
         end_iso_for_api = pendulum.instance(end).in_timezone("UTC").to_iso8601_string()
 
-        # Logging: show the window in LOCAL_TZ so developer logs match UI
-        logger.info("suggest: attendees=%s start(local)=%s end(local)=%s prompt=%s",
-                    attendees, start.to_iso8601_string(), end.to_iso8601_string(), prompt_text)
+        logger.info("suggest: attendees=%s start(local)=%s end(local)=%s prompt=%s explicit_time=%s requested_start=%s",
+                    attendees, start.to_iso8601_string(), end.to_iso8601_string(), prompt_text, explicit_flag, requested_start_iso)
         logger.info("FINAL search window (local): %s → %s", start.to_iso8601_string(), end.to_iso8601_string())
 
-        # call freebusy (it expects RFC3339 strings in UTC)
+        # ---------------- freebusy call ----------------
         fb = freebusy(creds, attendees, start_iso_for_api, end_iso_for_api)
         logger.info("RAW freebusy: %s", json.dumps(fb))
 
+        # prepare busy lists (raw strings)
+        busy_lists = [[{"start": b["start"], "end": b["end"]} for b in fb.get(cal, [])] for cal in fb]
 
-        # busy_lists: keep the raw ISO strings returned by Google (they include offsets)
-        busy_lists = [[{"start": b["start"], "end": b["end"]} for b in fb[cal]] for cal in fb]
-
-        # convert start/end to pendulum UTC datetimes for internal computations
-        start_pd_utc = pendulum.parse(start_iso_for_api)   # tz-aware (UTC)
+        # convert start/end to pendulum UTC datetimes
+        start_pd_utc = pendulum.parse(start_iso_for_api)   # tz-aware UTC
         end_pd_utc = pendulum.parse(end_iso_for_api)
 
-        # compute free windows (compute_free accepts datetime-like objects)
+        # compute free windows
         free = compute_free(busy_lists, start_pd_utc, end_pd_utc)
 
         # generate candidate slots
         raw_candidates = candidates(free, duration_min=duration_min, buffer_min=buffer_min)
 
-        # Anchor: only propose slots that start at-or-after the requested start time
+        # ---------------- strict filtering when explicit requested time present ----------------
+        cands = []
         now_utc = pendulum.now("UTC")
         effective_start = start_pd_utc if start_pd_utc > now_utc else now_utc
 
-        # filter raw_candidates so they are >= requested start (use pendulum.parse for safety)
-        cands = [c for c in raw_candidates if pendulum.parse(c["start"]) >= start_pd_utc]
+        if explicit_flag and requested_start_iso:
+            # strict window width in hours around requested start (configurable)
+            strict_hours = float(body.get("strict_window_hours", 2.0))
+            try:
+                req_pd_local = pendulum.parse(requested_start_iso)
+                # convert requested start to UTC for comparison with candidate starts (which are RFC ISO often in UTC)
+                req_pd_utc = req_pd_local.in_timezone("UTC")
+                strict_start_utc = req_pd_utc  # start at requested_start (can be adjusted to req_pd_utc - delta)
+                strict_end_utc = req_pd_utc.add(hours=strict_hours)
 
-        # If filtering removed all candidates, fall back to raw (so user still sees options)
+                logger.info("suggest: strict filtering active. requested_start(utc)=%s strict_end(utc)=%s", strict_start_utc.to_iso8601_string(), strict_end_utc.to_iso8601_string())
+
+                # primary filter: candidates inside strict window
+                cands = [c for c in raw_candidates if (pendulum.parse(c["start"]) >= strict_start_utc and pendulum.parse(c["start"]) <= strict_end_utc)]
+
+                # fallback 1: if none found, allow candidates >= requested_start
+                if not cands:
+                    logger.info("suggest: strict window returned no candidates; relaxing to candidates >= requested_start")
+                    cands = [c for c in raw_candidates if pendulum.parse(c["start"]) >= req_pd_utc]
+
+            except Exception:
+                logger.exception("suggest: failed strict requested_start parsing; falling back to standard behavior")
+                cands = [c for c in raw_candidates if pendulum.parse(c["start"]) >= start_pd_utc]
+        else:
+            # normal behaviour: proposals start at or after the requested start (start_pd_utc)
+            cands = [c for c in raw_candidates if pendulum.parse(c["start"]) >= start_pd_utc]
+
+        # If no candidates after filtering, relax progressively
         if not cands:
-            # Try relaxing: allow candidates after effective_start (now)
+            logger.info("suggest: no candidates after requested filtering; relaxing to effective_start >= now or window start")
             cands = [c for c in raw_candidates if pendulum.parse(c["start"]) >= effective_start]
-        if not cands:
-            cands = raw_candidates  # last-resort fallback
 
-        # fairness-aware scoring
+        if not cands:
+            logger.info("suggest: still none after relax; returning raw candidates (last resort)")
+            cands = raw_candidates
+
+        # ---------------- scoring & response ----------------
         scored = []
         for sl in cands:
             score, comp = _fairness_score(sl, fb)
             scored.append((score, comp, sl))
 
         top = sorted(scored, key=lambda x: x[0], reverse=True)[:3]
-        resp=[]
+        resp = []
         for score, comp, sl in top:
             start_dt = pendulum.parse(sl["start"])
-            end_dt   = pendulum.parse(sl["end"])
+            end_dt = pendulum.parse(sl["end"])
             why = explain(sl)
             why.update({"fairness": {
                 "midday_closeness": comp["midday_closeness"],
@@ -1166,6 +1228,7 @@ def suggest(body: dict = Body(default={})):
     except Exception as e:
         logger.exception("Exception in suggest: %s", traceback.format_exc())
         return JSONResponse({"error": "server_error", "detail": str(e), "trace": traceback.format_exc()}, status_code=500)
+
 
 
 # get_search_window_from_prompt uses pendulum and returns tz-aware start/end
