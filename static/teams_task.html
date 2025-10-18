@@ -114,26 +114,63 @@ async function fetchSuggestions(){
   noSlotsEl.style.display = 'none';
   confirmPanel.style.display = 'none';
   showStatus('');
+
   try{
-    const body = { prompt: PROMPT };
-    if(TODAY_ONLY && (TODAY_ONLY === '1' || TODAY_ONLY.toLowerCase()==='true')) body.today_only = true;
-    // include user_key so your server can consult calendar (it tolerates unknown keys)
+    // 1) Run parser first to detect explicit_time / requested_start
+    let parserResp = null;
+    try{
+      const pResp = await fetch(API_BASE + '/nlp/suggest', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ prompt: PROMPT })
+      });
+      if(pResp.ok) parserResp = await pResp.json();
+      else parserResp = null;
+    }catch(e){
+      // parser failing is non-fatal; we'll still call /suggest with prompt
+      console.warn('parser error', e);
+      parserResp = null;
+    }
+
+    // Build /suggest request body
+    const body = {
+      prompt: PROMPT,
+      // ensure timezone is explicit (matches your app LOCAL_TZ)
+      time_zone: 'Asia/Kolkata',            // <--- force same LOCAL_TZ as server
+      today_only: (TODAY_ONLY === '1' || TODAY_ONLY === 'true'),
+    };
     if(USER_KEY) body.user_key = USER_KEY;
     if(attendeesInput.value) body.attendees = attendeesInput.value.split(',').map(s=>s.trim()).filter(Boolean);
 
+    // 2) If parser says explicit_time, forward requested_start + explicit flag
+    // parserResp shape from parse_prompt_to_window may include explicit_time and requested_start
+    if(parserResp && (parserResp.explicit_time || parserResp.requested_start || parserResp.window_start)){
+      // prefer requested_start if present (parser returns it in local tz ISO)
+      const req = parserResp.requested_start || parserResp.window_start || null;
+      if(req){
+        body.explicit_time = true;
+        body.requested_start = req;
+        // optionally set a small window_start/window_end around requested_start (server can do it too)
+        // body.window_start = req;
+        // body.window_end = some computed iso if you want
+      }
+    }
+
+    // 3) Call /suggest (final producer)
     const r = await fetch(API_BASE + '/suggest', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
       body: JSON.stringify(body)
     });
+
     if(!r.ok){
       const txt = await r.text().catch(()=>'{no body}');
       throw new Error('Suggest failed: ' + r.status + ' ' + txt);
     }
+
     const json = await r.json();
     const arr = canonicalizeList(json);
     SUGGESTIONS = arr.map(x => {
-      // normalize shape: ensure start & end at top-level and human label
       const start = (x.slot && x.slot.start) || x.start || (x.requested_start || null);
       const end   = (x.slot && x.slot.end)   || x.end   || null;
       const human = x.human || (x.explanation && x.explanation.readable) || fmtHuman(x);
@@ -150,13 +187,12 @@ async function fetchSuggestions(){
     loadingEl.style.display = 'none';
     slotsEl.style.display = 'block';
     confirmPanel.style.display = 'block';
-    // pre-populate subject from prompt
     subjectInput.value = subjectInput.value || (PROMPT.length>0 ? (PROMPT.length<=120 ? PROMPT : PROMPT.slice(0,116)+'...') : 'Meeting');
     showStatus('');
   }catch(err){
+    console.error(err);
     loadingEl.style.display = 'none';
     showStatus('Failed to fetch suggestions: ' + (err.message || err), true);
-    console.error(err);
   }
 }
 
