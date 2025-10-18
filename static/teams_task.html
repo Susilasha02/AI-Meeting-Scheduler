@@ -1,77 +1,274 @@
-<!-- put at static/teams_task.html -->
-<!doctype html><meta charset="utf-8"/>
-<title>Confirm meeting</title>
-<style>body{font-family:Inter,system-ui; padding:20px; max-width:720px}</style>
-<h3>Suggested slots</h3>
-<div id="slots">Loading…</div>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Confirm meeting — AI Scheduler</title>
+<style>
+  body{font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif;padding:18px;max-width:860px;margin:0 auto;color:#0f172a}
+  h2{margin:0 0 12px}
+  .note{color:#6b7280;margin-bottom:12px}
+  .slots{display:flex;flex-direction:column;gap:12px}
+  .slot{border:1px solid #eef2ff;padding:10px;border-radius:8px;background:#fff}
+  .slot .human{font-weight:700}
+  .controls{margin-top:14px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .input{width:100%;padding:8px;border-radius:8px;border:1px solid #e6e9ef}
+  .row{display:flex;gap:8px}
+  button{cursor:pointer;border-radius:8px;padding:8px 12px;border:0;font-weight:600}
+  .btn-primary{background:linear-gradient(90deg,#4f46e5,#06b6d4);color:#fff}
+  .btn-ghost{background:#fff;border:1px solid #e6e9ef;color:#0f172a}
+  .muted{color:#6b7280;font-size:13px}
+  .small{font-size:13px;color:#6b7280}
+</style>
+</head>
+<body>
+  <h2>Suggested slots</h2>
+  <div class="note">Confirm a slot to create the event in your Microsoft calendar. If you haven't connected Microsoft, click <strong>Connect Microsoft</strong>.</div>
+
+  <div id="main">
+    <div id="loading" class="small">Loading suggestions…</div>
+
+    <div id="slots" class="slots" style="display:none"></div>
+
+    <div id="no-slots" style="display:none" class="muted">No suggestions were returned.</div>
+
+    <div id="confirm-panel" style="display:none;margin-top:18px">
+      <div style="margin-bottom:8px"><input id="subject" class="input" placeholder="Subject (optional) — e.g. Quick sync" /></div>
+      <div style="margin-bottom:8px"><input id="attendees" class="input" placeholder="Attendees (comma separated emails) — optional" /></div>
+      <div class="controls">
+        <button id="createBtn" class="btn-primary">Create event</button>
+        <button id="connectMsBtn" class="btn-ghost">Connect Microsoft</button>
+        <div id="status" class="small muted"></div>
+      </div>
+    </div>
+  </div>
+
 <script>
-const params = new URLSearchParams(location.search);
-const prompt = params.get("prompt") || "";
-const user_key = params.get("user_key") || "";  // email: used to pick MS account
+/*
+  teams_task.html behaviour:
+   - Query params:
+       prompt (required)
+       user_key (recommended) — email/UPN used to look up ms token
+       attendees (optional, comma separated)
+       today_only (optional, "1" or "true")
+   - Calls /suggest with prompt + user_key to retrieve final candidates (same as main UI)
+   - Renders up to the returned suggestions (we handle either array or { slots: [...] } style)
+   - Allows editing subject and attendees, and posts to /ms/graph/create_event with user_key
+   - If MS is not connected (server returns 401/not_connected), shows Connect button which goes to /ms/auth/start?next=<current page>
+*/
+
+const Q = new URLSearchParams(location.search);
+const PROMPT = Q.get('prompt') || '';
+const USER_KEY = Q.get('user_key') || '';
+const ATT_Q = Q.get('attendees') || '';
+const TODAY_ONLY = Q.get('today_only') || '';
 const API_BASE = location.origin.replace(/\/$/, '');
 
-// fetch suggestions from your /nlp/suggest (POST)
-async function getSlots() {
-  const resp = await fetch(API_BASE + '/nlp/suggest', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ prompt })
-  });
-  const data = await resp.json();
-  return data; // expects list of up-to-3 suggestions in response (your app returns this)
+const slotsEl = document.getElementById('slots');
+const loadingEl = document.getElementById('loading');
+const noSlotsEl = document.getElementById('no-slots');
+const confirmPanel = document.getElementById('confirm-panel');
+const createBtn = document.getElementById('createBtn');
+const connectMsBtn = document.getElementById('connectMsBtn');
+const statusEl = document.getElementById('status');
+const subjectInput = document.getElementById('subject');
+const attendeesInput = document.getElementById('attendees');
+
+let SUGGESTIONS = [];   // canonical array of { start, end, human, slot? ... }
+let SELECTED_INDEX = null;
+
+attendeesInput.value = ATT_Q.replace(/\+/g, ' ');
+
+function showStatus(msg, isError=false){
+  statusEl.textContent = msg || '';
+  statusEl.style.color = isError ? '#b91c1c' : '#6b7280';
 }
 
-function renderSlots(slots) {
-  const div = document.getElementById('slots');
-  if(!slots || !slots.length) {
-    div.innerHTML = '<div>No slots found.</div>';
+function fmtHuman(s){
+  if(!s) return '';
+  if(s.human) return s.human;
+  if(s.slot && (s.slot.start || s.slot.end)) {
+    return (s.slot.start || s.start) + ' → ' + (s.slot.end || s.end);
+  }
+  if(s.start && s.end) return s.start + ' → ' + s.end;
+  return JSON.stringify(s).slice(0,150);
+}
+
+function canonicalizeList(resp){
+  // resp may already be an array, or may be object with .slots, or parser result etc.
+  if(!resp) return [];
+  if(Array.isArray(resp)) return resp;
+  if(resp.slots && Array.isArray(resp.slots)) return resp.slots;
+  // sometimes server returns array-like object; attempt to extract keys
+  if(resp.length && typeof resp.length === 'number') return Array.from(resp);
+  return [];
+}
+
+async function fetchSuggestions(){
+  if(!PROMPT){
+    loadingEl.textContent = "No prompt provided.";
     return;
   }
-  div.innerHTML = '';
-  slots.forEach((s,i) => {
-    const human = s.human || (s.slot && s.slot.start) || s.start;
-    const start = (s.slot && s.slot.start) || s.start;
-    const end = (s.slot && s.slot.end) || s.end;
-    const el = document.createElement('div');
-    el.style.marginBottom = '12px';
-    el.innerHTML = `<div style="font-weight:700">${human}</div>
-      <div style="margin-top:6px"><button id="btn_${i}">Confirm this slot</button></div>`;
-    div.appendChild(el);
-    document.getElementById(`btn_${i}`).onclick = ()=> confirmSlot(start, end, human);
-  });
-}
-
-async function confirmSlot(start, end, display) {
-  // prompt confirmation to user
-  if(!confirm('Create event at:\\n' + display + '\\n(Will create in your Microsoft calendar)')) return;
-  document.body.style.opacity = 0.6;
-
-  // Build request to server create_event
-  const payload = {
-    user_key, start, end,
-    subject: 'Meeting scheduled via AI',
-    attendees: []  // optionally prompt user to add attendee emails
-  };
-  const resp = await fetch(API_BASE + '/ms/graph/create_event', {
-    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload)
-  });
-  const data = await resp.json();
-  if(resp.ok){
-    alert('Event created! Join link (if any):\\n' + (data.onlineMeeting && data.onlineMeeting.joinUrl || data.webLink || data.htmlLink || 'n/a'));
-    // tell Teams parent to close task module (if opened via Teams SDK)
-    try { parent.postMessage({ action: 'close' }, '*'); } catch(e){}
-  }else{
-    alert('Failed to create event: ' + JSON.stringify(data));
-  }
-  document.body.style.opacity = 1;
-}
-
-(async ()=> {
+  loadingEl.style.display = 'block';
+  slotsEl.style.display = 'none';
+  noSlotsEl.style.display = 'none';
+  confirmPanel.style.display = 'none';
+  showStatus('');
   try{
-    const slots = await getSlots();
-    renderSlots(slots);
-  }catch(e){
-    document.getElementById('slots').textContent = 'Error fetching slots: ' + e;
+    const body = { prompt: PROMPT };
+    if(TODAY_ONLY && (TODAY_ONLY === '1' || TODAY_ONLY.toLowerCase()==='true')) body.today_only = true;
+    // include user_key so your server can consult calendar (it tolerates unknown keys)
+    if(USER_KEY) body.user_key = USER_KEY;
+    if(attendeesInput.value) body.attendees = attendeesInput.value.split(',').map(s=>s.trim()).filter(Boolean);
+
+    const r = await fetch(API_BASE + '/suggest', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+    if(!r.ok){
+      const txt = await r.text().catch(()=>'{no body}');
+      throw new Error('Suggest failed: ' + r.status + ' ' + txt);
+    }
+    const json = await r.json();
+    const arr = canonicalizeList(json);
+    SUGGESTIONS = arr.map(x => {
+      // normalize shape: ensure start & end at top-level and human label
+      const start = (x.slot && x.slot.start) || x.start || (x.requested_start || null);
+      const end   = (x.slot && x.slot.end)   || x.end   || null;
+      const human = x.human || (x.explanation && x.explanation.readable) || fmtHuman(x);
+      return Object.assign({}, x, { start, end, human });
+    });
+
+    if(SUGGESTIONS.length === 0){
+      loadingEl.style.display = 'none';
+      noSlotsEl.style.display = 'block';
+      return;
+    }
+
+    renderSlots();
+    loadingEl.style.display = 'none';
+    slotsEl.style.display = 'block';
+    confirmPanel.style.display = 'block';
+    // pre-populate subject from prompt
+    subjectInput.value = subjectInput.value || (PROMPT.length>0 ? (PROMPT.length<=120 ? PROMPT : PROMPT.slice(0,116)+'...') : 'Meeting');
+    showStatus('');
+  }catch(err){
+    loadingEl.style.display = 'none';
+    showStatus('Failed to fetch suggestions: ' + (err.message || err), true);
+    console.error(err);
   }
-})();
+}
+
+function renderSlots(){
+  slotsEl.innerHTML = '';
+  SUGGESTIONS.forEach((s, idx) => {
+    const el = document.createElement('div');
+    el.className = 'slot';
+    el.innerHTML = `
+      <div class="human">${s.human || (s.start + ' → ' + s.end)}</div>
+      <div class="small muted" style="margin-top:6px">${s.start || ''} → ${s.end || ''}</div>
+      <div style="margin-top:8px">
+        <button class="btn-ghost" data-idx="${idx}" style="margin-right:8px">Select</button>
+        <button class="btn-ghost" data-idx-view="${idx}">Open raw</button>
+      </div>
+    `;
+    slotsEl.appendChild(el);
+  });
+
+  // attach handlers
+  slotsEl.querySelectorAll('button[data-idx]').forEach(b=>{
+    b.onclick = (ev)=>{
+      const idx = Number(ev.currentTarget.getAttribute('data-idx'));
+      selectSlot(idx);
+    };
+  });
+  slotsEl.querySelectorAll('button[data-idx-view]').forEach(b=>{
+    b.onclick = (ev)=>{
+      const idx = Number(ev.currentTarget.getAttribute('data-idx-view'));
+      alert('Raw candidate JSON:\\n' + JSON.stringify(SUGGESTIONS[idx], null, 2));
+    };
+  });
+
+  // select first by default
+  if(SUGGESTIONS.length>0) selectSlot(0);
+}
+
+function selectSlot(idx){
+  SELECTED_INDEX = idx;
+  // visually mark (simple): scroll into view and highlight background briefly
+  const children = Array.from(slotsEl.children);
+  children.forEach((c,i)=> c.style.boxShadow = (i===idx) ? '0 6px 20px rgba(79,70,229,0.08)' : 'none');
+  showStatus('Selected slot: ' + (SUGGESTIONS[idx].human || (SUGGESTIONS[idx].start + ' → ' + SUGGESTIONS[idx].end)));
+}
+
+function openConnectMs(){
+  // redirect user to ms auth with next back to current page (preserve prompt + user_key)
+  const next = encodeURIComponent(location.pathname + location.search);
+  window.location.href = API_BASE + '/ms/auth/start?next=' + next;
+}
+
+connectMsBtn.addEventListener('click', openConnectMs);
+
+createBtn.addEventListener('click', async ()=>{
+  showStatus('');
+  if(SELECTED_INDEX === null){ showStatus('Please select a slot first', true); return; }
+  const sel = SUGGESTIONS[SELECTED_INDEX];
+  if(!sel || !sel.start || !sel.end){ showStatus('Selected slot is missing start/end', true); return; }
+
+  const subject = (subjectInput.value || 'Meeting scheduled via AI').trim();
+  const attendees = attendeesInput.value ? attendeesInput.value.split(',').map(s=>s.trim()).filter(Boolean) : [];
+  const payload = {
+    user_key: (USER_KEY || ''), // server will error if missing, so UI should collect
+    start: sel.start,
+    end: sel.end,
+    subject,
+    attendees,
+    body: `Scheduled from prompt: ${PROMPT}`
+  };
+
+  try{
+    showStatus('Creating event...');
+    createBtn.disabled = true;
+    const r = await fetch(API_BASE + '/ms/graph/create_event', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const data = await r.json().catch(()=>null);
+    if(r.ok){
+      showStatus('Event created successfully.', false);
+      // show join link if present
+      const link = (data && (data.onlineMeeting && data.onlineMeeting.joinUrl || data.webLink || data.htmlLink)) || '';
+      if(link){
+        const msg = 'Event created. Join link:\\n' + link;
+        alert(msg);
+      } else {
+        alert('Event created successfully.');
+      }
+      // attempt to notify parent (Teams) to close Task Module if iframe parent supports postMessage
+      try{ parent.postMessage({ action: 'close', result: data || {} }, '*'); }catch(e){}
+    } else {
+      // server returned non-200: show message and give connect option if not_connected
+      if(data && data.error === 'not_connected'){
+        showStatus('Microsoft account not connected for this user. Click Connect Microsoft to sign in.', true);
+      } else if(data && data.error === 'missing_user_key'){
+        showStatus('Missing user_key — include user_key in the Task Module url query (e.g., ?user_key=you@example.com).', true);
+      } else {
+        showStatus('Create failed: ' + (JSON.stringify(data) || 'unknown'), true);
+      }
+      console.error('create error', data);
+    }
+  }catch(e){
+    console.error(e);
+    showStatus('Unexpected error: ' + (e.message || e), true);
+  } finally {
+    createBtn.disabled = false;
+  }
+});
+
+// bootstrap
+fetchSuggestions();
 </script>
+</body>
+</html>
