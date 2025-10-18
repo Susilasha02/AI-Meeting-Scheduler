@@ -7,6 +7,8 @@ import uuid
 import zoneinfo
 import urllib.parse
 import logging
+import requests
+import time
 from typing import List, Dict, Tuple
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -25,7 +27,7 @@ from google.auth.transport.requests import AuthorizedSession
 
 from dateutil import parser as dparse
 import pendulum
-import os
+
 print(">>> STARTUP app.py loaded from:", __file__, "CWD:", os.getcwd())
 
 
@@ -36,6 +38,62 @@ PORT = int(os.getenv("PORT", "3978"))
 CLIENT_FILE = os.getenv("CLIENT_FILE", "/etc/secrets/google_oauth_client.json")
 
 LOCAL_TZ = os.getenv("TIME_ZONE", "UTC")
+# --- place near your Google oauth helpers in app.py ---
+
+
+MS_CLIENT_ID = os.getenv("MS_CLIENT_ID", "")
+MS_CLIENT_SECRET = os.getenv("MS_CLIENT_SECRET", "")
+MS_TENANT = os.getenv("MS_TENANT", "common")  # "common" or tenant id
+MS_REDIRECT = APP_BASE_URL.rstrip("/") + "/ms/auth/callback"
+MS_SCOPES = ["openid","profile","offline_access","User.Read","Calendars.ReadWrite"]
+
+MS_AUTH_URL = f"https://login.microsoftonline.com/{MS_TENANT}/oauth2/v2.0/authorize"
+MS_TOKEN_URL = f"https://login.microsoftonline.com/{MS_TENANT}/oauth2/v2.0/token"
+
+# token store helpers (re-using token_store.json style)
+def ms_save_token(user_key: str, token_response: dict):
+    """
+    store token_response = dict from token endpoint (access_token, refresh_token, expires_in, scope, etc.)
+    """
+    data = {}
+    if os.path.exists(TOKEN_STORE):
+        data = json.loads(open(TOKEN_STORE, "r").read() or "{}")
+    data.setdefault("ms_tokens", {})
+    token_entry = token_response.copy()
+    # store expiry absolute
+    token_entry["_saved_at"] = int(time.time())
+    token_entry["_expires_at"] = int(time.time()) + int(token_entry.get("expires_in", 0))
+    data["ms_tokens"][user_key] = token_entry
+    with open(TOKEN_STORE, "w") as f:
+        json.dump(data, f, indent=2)
+
+def ms_load_token(user_key: str) -> dict | None:
+    if not os.path.exists(TOKEN_STORE):
+        return None
+    data = json.loads(open(TOKEN_STORE, "r").read() or "{}")
+    return data.get("ms_tokens", {}).get(user_key)
+
+def ms_refresh_token_if_needed(user_key: str) -> dict:
+    tok = ms_load_token(user_key)
+    if not tok:
+        return None
+    now = int(time.time())
+    if tok.get("_expires_at", 0) - now > 60:
+        return tok
+    # refresh
+    payload = {
+        "client_id": MS_CLIENT_ID,
+        "scope": " ".join(MS_SCOPES),
+        "refresh_token": tok.get("refresh_token"),
+        "grant_type": "refresh_token",
+        "client_secret": MS_CLIENT_SECRET,
+    }
+    r = requests.post(MS_TOKEN_URL, data=payload, timeout=10)
+    r.raise_for_status()
+    newtok = r.json()
+    ms_save_token(user_key, newtok)
+    return ms_load_token(user_key)
+
 
 # --------- stores ----------
 TOKEN_STORE = "token_store.json"
@@ -1819,3 +1877,112 @@ def get_mom(mom_id: str):
         participants_html = parts_html
     )
     return HTMLResponse(html)
+from fastapi import Query
+
+@app.get("/ms/auth/start")
+def ms_auth_start(next: str = "/ui/"):
+    """
+    Redirect user to Microsoft sign-in. `next` is optional redirect after success.
+    """
+    # state can carry the next url (simple approach)
+    state = urllib.parse.quote(next, safe="")
+    params = {
+        "client_id": MS_CLIENT_ID,
+        "response_type": "code",
+        "redirect_uri": MS_REDIRECT,
+        "response_mode": "query",
+        "scope": " ".join(MS_SCOPES),
+        "state": state
+    }
+    url = MS_AUTH_URL + "?" + urllib.parse.urlencode(params)
+    return RedirectResponse(url)
+
+@app.get("/ms/auth/callback")
+def ms_auth_callback(code: str = Query(...), state: str | None = Query(None)):
+    """
+    Exchange code for token, save, then redirect to original 'next' if provided.
+    We'll attempt to read user's email (preferred) to key tokens by email; fallback to 'ms_user'.
+    """
+    payload = {
+        "client_id": MS_CLIENT_ID,
+        "scope": " ".join(MS_SCOPES),
+        "code": code,
+        "redirect_uri": MS_REDIRECT,
+        "grant_type": "authorization_code",
+        "client_secret": MS_CLIENT_SECRET,
+    }
+    r = requests.post(MS_TOKEN_URL, data=payload, timeout=10)
+    try:
+        r.raise_for_status()
+    except Exception:
+        return JSONResponse({"error": "ms_token_failed", "detail": r.text}, status_code=400)
+    token_resp = r.json()
+
+    # try to fetch user info to get stable key (email)
+    try:
+        hdr = {"Authorization": "Bearer " + token_resp["access_token"]}
+        me = requests.get("https://graph.microsoft.com/v1.0/me", headers=hdr, timeout=8).json()
+        user_key = (me.get("mail") or me.get("userPrincipalName") or "ms_user").lower()
+    except Exception:
+        user_key = "ms_user"
+
+    # save token
+    ms_save_token(user_key, token_resp)
+
+    # redirect back
+    next_url = urllib.parse.unquote(state) if state else "/ui/"
+    return RedirectResponse(next_url)
+
+def ms_create_event(user_key: str, event_body: dict):
+    """
+    event_body: Graph event JSON per https://learn.microsoft.com/graph/api/user-post-events
+    Requires ms token for user_key stored via ms_save_token.
+    """
+    tok = ms_refresh_token_if_needed(user_key)
+    if not tok:
+        raise RuntimeError("not_connected_ms")
+    headers = {
+        "Authorization": "Bearer " + tok["access_token"],
+        "Content-Type": "application/json"
+    }
+    # optionally ask Graph to create online meeting:
+    # event_body["onlineMeetingProvider"] = "teamsForBusiness"
+
+    r = requests.post("https://graph.microsoft.com/v1.0/me/events", headers=headers, json=event_body, timeout=10)
+    r.raise_for_status()
+    return r.json()
+@app.post("/ms/graph/create_event")
+def ms_graph_create_event(body: dict = Body(...)):
+    """
+    Body expected:
+      - user_key: email (or "ms_user")
+      - start: ISO string (with offset)  e.g. "2025-10-18T09:30:00+05:30"
+      - end: ISO string
+      - subject, attendees (list), body (string)
+    Returns Graph event JSON on success.
+    """
+    user_key = (body.get("user_key") or "").lower()
+    if not user_key:
+        return JSONResponse({"error": "missing_user_key"}, status_code=400)
+    try:
+        start = body["start"]
+        end = body["end"]
+        subject = body.get("subject", "Meeting scheduled via AI scheduler")
+        attendees = body.get("attendees", [])  # list of emails
+        event_body = {
+            "subject": subject,
+            "body": {"contentType": "HTML", "content": body.get("body", "")},
+            "start": {"dateTime": start, "timeZone": LOCAL_TZ},
+            "end": {"dateTime": end, "timeZone": LOCAL_TZ},
+            "attendees": [{"emailAddress": {"address": a, "name": a.split("@")[0]}, "type": "required"} for a in attendees],
+            # create online meeting (Teams) — optional
+            "isOnlineMeeting": True,
+            "onlineMeetingProvider": "teamsForBusiness"
+        }
+        ev = ms_create_event(user_key, event_body)
+        return ev
+    except requests.HTTPError as he:
+        return JSONResponse({"error":"graph_error","detail": str(he), "response": getattr(he.response, "text", "")}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"error":"server_error","detail": str(e)}, status_code=500)
+

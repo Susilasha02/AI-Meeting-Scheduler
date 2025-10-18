@@ -1,0 +1,77 @@
+<!-- put at static/teams_task.html -->
+<!doctype html><meta charset="utf-8"/>
+<title>Confirm meeting</title>
+<style>body{font-family:Inter,system-ui; padding:20px; max-width:720px}</style>
+<h3>Suggested slots</h3>
+<div id="slots">Loading…</div>
+<script>
+const params = new URLSearchParams(location.search);
+const prompt = params.get("prompt") || "";
+const user_key = params.get("user_key") || "";  // email: used to pick MS account
+const API_BASE = location.origin.replace(/\/$/, '');
+
+// fetch suggestions from your /nlp/suggest (POST)
+async function getSlots() {
+  const resp = await fetch(API_BASE + '/nlp/suggest', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ prompt })
+  });
+  const data = await resp.json();
+  return data; // expects list of up-to-3 suggestions in response (your app returns this)
+}
+
+function renderSlots(slots) {
+  const div = document.getElementById('slots');
+  if(!slots || !slots.length) {
+    div.innerHTML = '<div>No slots found.</div>';
+    return;
+  }
+  div.innerHTML = '';
+  slots.forEach((s,i) => {
+    const human = s.human || (s.slot && s.slot.start) || s.start;
+    const start = (s.slot && s.slot.start) || s.start;
+    const end = (s.slot && s.slot.end) || s.end;
+    const el = document.createElement('div');
+    el.style.marginBottom = '12px';
+    el.innerHTML = `<div style="font-weight:700">${human}</div>
+      <div style="margin-top:6px"><button id="btn_${i}">Confirm this slot</button></div>`;
+    div.appendChild(el);
+    document.getElementById(`btn_${i}`).onclick = ()=> confirmSlot(start, end, human);
+  });
+}
+
+async function confirmSlot(start, end, display) {
+  // prompt confirmation to user
+  if(!confirm('Create event at:\\n' + display + '\\n(Will create in your Microsoft calendar)')) return;
+  document.body.style.opacity = 0.6;
+
+  // Build request to server create_event
+  const payload = {
+    user_key, start, end,
+    subject: 'Meeting scheduled via AI',
+    attendees: []  // optionally prompt user to add attendee emails
+  };
+  const resp = await fetch(API_BASE + '/ms/graph/create_event', {
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload)
+  });
+  const data = await resp.json();
+  if(resp.ok){
+    alert('Event created! Join link (if any):\\n' + (data.onlineMeeting && data.onlineMeeting.joinUrl || data.webLink || data.htmlLink || 'n/a'));
+    // tell Teams parent to close task module (if opened via Teams SDK)
+    try { parent.postMessage({ action: 'close' }, '*'); } catch(e){}
+  }else{
+    alert('Failed to create event: ' + JSON.stringify(data));
+  }
+  document.body.style.opacity = 1;
+}
+
+(async ()=> {
+  try{
+    const slots = await getSlots();
+    renderSlots(slots);
+  }catch(e){
+    document.getElementById('slots').textContent = 'Error fetching slots: ' + e;
+  }
+})();
+</script>
