@@ -158,7 +158,7 @@ async function fetchSuggestions(){
     // 3) Call /suggest (final producer)
 // --- START: run parser and forward explicit_time/requested_start when present ---
 try {
-  const parserRespRaw = await fetch(API_BASE + '/nlp/suggest', {
+  const parserRespRaw = await fetch(API_BASE + '/suggest/with_parser', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ prompt: PROMPT })

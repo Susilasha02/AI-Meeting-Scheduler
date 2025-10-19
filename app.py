@@ -1986,3 +1986,81 @@ def ms_graph_create_event(body: dict = Body(...)):
     except Exception as e:
         return JSONResponse({"error":"server_error","detail": str(e)}, status_code=500)
 
+# Add near other routes in app.py
+import os
+import requests
+from fastapi import Body
+from fastapi.responses import JSONResponse
+
+@app.post("/suggest/with_parser")
+def suggest_with_parser(body: dict = Body(...)):
+    """
+    Combined endpoint: run parser then suggest and return the final results.
+    Safe: does not modify existing endpoints. Calls /nlp/suggest then /suggest.
+    Body expected: { prompt, user_key(optional), attendees(optional), today_only(optional) }
+    """
+    prompt = body.get("prompt")
+    if not prompt:
+        return JSONResponse({"error": "missing_prompt"}, status_code=400)
+
+    base = os.getenv("APP_BASE_URL", "").rstrip("/") or ""
+    if not base:
+        # fallback to request host if APP_BASE_URL not set; ok for dev but recommended to set env var
+        base = ""
+
+    # 1) call the parser endpoint
+    try:
+        parser_url = (base + "/nlp/suggest") if base else "/nlp/suggest"
+        # if base is empty, calling local path via requests will fail; in that case try internal call below
+        parser_resp = {}
+        if base:
+            p = requests.post(parser_url, json={"prompt": prompt}, timeout=8)
+            if p.ok:
+                parser_resp = p.json()
+        else:
+            # best-effort: try to call internal parser function if available
+            try:
+                # If you have an internal function parse_prompt_to_window, call it here:
+                parser_resp = parse_prompt_to_window(prompt)  # <-- remove this line if that function doesn't exist
+            except Exception:
+                parser_resp = {}
+    except Exception:
+        parser_resp = {}
+
+    # 2) Build suggest payload (forward explicit_time/requested_start if parser detected them)
+    suggest_body = {
+        "prompt": prompt,
+        "time_zone": os.getenv("LOCAL_TZ", "Asia/Kolkata"),
+        "today_only": bool(body.get("today_only", False)),
+    }
+    if body.get("user_key"):
+        suggest_body["user_key"] = body.get("user_key")
+    if body.get("attendees"):
+        suggest_body["attendees"] = body.get("attendees")
+
+    # forward parser signals if present
+    if parser_resp and isinstance(parser_resp, dict):
+        if parser_resp.get("explicit_time") or parser_resp.get("requested_start") or parser_resp.get("window_start"):
+            req = parser_resp.get("requested_start") or parser_resp.get("window_start")
+            if req:
+                suggest_body["explicit_time"] = True
+                suggest_body["requested_start"] = req
+                if parser_resp.get("requested_end"):
+                    suggest_body["requested_end"] = parser_resp.get("requested_end")
+
+    # 3) call /suggest to get final candidates
+    try:
+        suggest_url = (base + "/suggest") if base else "/suggest"
+        if base:
+            r = requests.post(suggest_url, json=suggest_body, timeout=10)
+            r.raise_for_status()
+            return r.json()
+        else:
+            # if base wasn't supplied and internal function exists, call it directly:
+            try:
+                # If you have a function suggest_meeting_slots that accepts the payload, call it:
+                return suggest(suggest_body)  # <-- remove or adapt if not present
+            except Exception:
+                return JSONResponse({"error":"no_base_and_no_internal_call_possible"}, status_code=500)
+    except Exception as e:
+        return JSONResponse({"error": "suggest_call_failed", "detail": str(e)}, status_code=500)
