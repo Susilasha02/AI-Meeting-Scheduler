@@ -132,27 +132,26 @@ async function fetchSuggestions(){
       parserResp = null;
     }
 
-    // Build /suggest request body
+    // Build /suggest request body (force LOCAL_TZ so task UI uses same timezone as main UI)
     const body = {
       prompt: PROMPT,
-      // ensure timezone is explicit (matches your app LOCAL_TZ)
-      time_zone: 'Asia/Kolkata',            // <--- force same LOCAL_TZ as server
+      time_zone: 'Asia/Kolkata',            // keep same as server LOCAL_TZ
       today_only: (TODAY_ONLY === '1' || TODAY_ONLY === 'true'),
     };
     if(USER_KEY) body.user_key = USER_KEY;
+    // prefer the attendees input field over query param if user edited it in UI
     if(attendeesInput.value) body.attendees = attendeesInput.value.split(',').map(s=>s.trim()).filter(Boolean);
+    else if(ATT_Q) body.attendees = ATT_Q.split(',').map(s=>s.trim()).filter(Boolean);
 
     // 2) If parser says explicit_time, forward requested_start + explicit flag
-    // parserResp shape from parse_prompt_to_window may include explicit_time and requested_start
+    // This ensures /suggest tightens around requested_start (so you get the 2pm slot)
     if(parserResp && (parserResp.explicit_time || parserResp.requested_start || parserResp.window_start)){
-      // prefer requested_start if present (parser returns it in local tz ISO)
       const req = parserResp.requested_start || parserResp.window_start || null;
       if(req){
         body.explicit_time = true;
         body.requested_start = req;
-        // optionally set a small window_start/window_end around requested_start (server can do it too)
-        // body.window_start = req;
-        // body.window_end = some computed iso if you want
+        // If parser returned a window_end, forward it too
+        if(parserResp.requested_end) body.requested_end = parserResp.requested_end;
       }
     }
 
