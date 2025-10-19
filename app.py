@@ -1986,81 +1986,65 @@ def ms_graph_create_event(body: dict = Body(...)):
     except Exception as e:
         return JSONResponse({"error":"server_error","detail": str(e)}, status_code=500)
 
-# Add near other routes in app.py
-import os
-import requests
+# add imports at top if not already present
 from fastapi import Body
 from fastapi.responses import JSONResponse
 
 @app.post("/suggest/with_parser")
 def suggest_with_parser(body: dict = Body(...)):
     """
-    Combined endpoint: run parser then suggest and return the final results.
-    Safe: does not modify existing endpoints. Calls /nlp/suggest then /suggest.
-    Body expected: { prompt, user_key(optional), attendees(optional), today_only(optional) }
+    Safe wrapper used by Teams Task Module: parse prompt server-side then call the
+    existing suggest(...) function and return its result. Does NOT modify existing endpoints.
+    Expected body shape: { prompt, user_key(optional), attendees(optional), today_only(optional) }
     """
-    prompt = body.get("prompt")
+    prompt = (body.get("prompt") or "").strip()
     if not prompt:
         return JSONResponse({"error": "missing_prompt"}, status_code=400)
 
-    base = os.getenv("APP_BASE_URL", "").rstrip("/") or ""
-    if not base:
-        # fallback to request host if APP_BASE_URL not set; ok for dev but recommended to set env var
-        base = ""
-
-    # 1) call the parser endpoint
     try:
-        parser_url = (base + "/nlp/suggest") if base else "/nlp/suggest"
-        # if base is empty, calling local path via requests will fail; in that case try internal call below
-        parser_resp = {}
-        if base:
-            p = requests.post(parser_url, json={"prompt": prompt}, timeout=8)
-            if p.ok:
-                parser_resp = p.json()
-        else:
-            # best-effort: try to call internal parser function if available
-            try:
-                # If you have an internal function parse_prompt_to_window, call it here:
-                parser_resp = parse_prompt_to_window(prompt)  # <-- remove this line if that function doesn't exist
-            except Exception:
-                parser_resp = {}
-    except Exception:
-        parser_resp = {}
+        # 1) produce a parsed config compatible with suggest()
+        try:
+            # parse_prompt(...) is defined in app.py and returns dict with
+            # window_start/window_end/duration_min/explicit_time/requested_start, etc.
+            parsed_cfg = parse_prompt(prompt, load_contacts())
+        except Exception as e:
+            # defensive fallback: log and fall back to empty parsed dict
+            logger.exception("suggest_with_parser: parse_prompt failed, continuing: %s", str(e))
+            parsed_cfg = {}
 
-    # 2) Build suggest payload (forward explicit_time/requested_start if parser detected them)
-    suggest_body = {
-        "prompt": prompt,
-        "time_zone": os.getenv("LOCAL_TZ", "Asia/Kolkata"),
-        "today_only": bool(body.get("today_only", False)),
-    }
-    if body.get("user_key"):
-        suggest_body["user_key"] = body.get("user_key")
-    if body.get("attendees"):
-        suggest_body["attendees"] = body.get("attendees")
+        # 2) build suggest body: parsed config is base, override with any explicit fields from incoming body
+        suggest_body = {}
+        # Start with parsed defaults when available
+        if isinstance(parsed_cfg, dict):
+            suggest_body.update(parsed_cfg)
 
-    # forward parser signals if present
-    if parser_resp and isinstance(parser_resp, dict):
-        if parser_resp.get("explicit_time") or parser_resp.get("requested_start") or parser_resp.get("window_start"):
-            req = parser_resp.get("requested_start") or parser_resp.get("window_start")
-            if req:
-                suggest_body["explicit_time"] = True
-                suggest_body["requested_start"] = req
-                if parser_resp.get("requested_end"):
-                    suggest_body["requested_end"] = parser_resp.get("requested_end")
+        # Now let the incoming body override parsed values (attendees, explicit flags etc.)
+        # We intentionally copy keys commonly used by suggest()
+        for k in ("prompt", "user_key", "attendees", "duration_min", "buffer_min", "window_start", "window_end", "explicit_time", "requested_start", "requested_end", "time_zone", "today_only"):
+            if k in body and body[k] is not None:
+                suggest_body[k] = body[k]
 
-    # 3) call /suggest to get final candidates
-    try:
-        suggest_url = (base + "/suggest") if base else "/suggest"
-        if base:
-            r = requests.post(suggest_url, json=suggest_body, timeout=10)
-            r.raise_for_status()
-            return r.json()
-        else:
-            # if base wasn't supplied and internal function exists, call it directly:
-            try:
-                # If you have a function suggest_meeting_slots that accepts the payload, call it:
-                return suggest(suggest_body)  # <-- remove or adapt if not present
-            except Exception:
-                return JSONResponse({"error":"no_base_and_no_internal_call_possible"}, status_code=500)
+        # ensure time_zone exists (use LOCAL_TZ from env if not set)
+        suggest_body.setdefault("time_zone", os.getenv("LOCAL_TZ", "Asia/Kolkata"))
+
+        # If parse_prompt indicated explicit_time/requested_start but incoming body didn't provide explicit_time,
+        # preserve what parser returned
+        if parsed_cfg and isinstance(parsed_cfg, dict):
+            if parsed_cfg.get("explicit_time") and parsed_cfg.get("requested_start"):
+                suggest_body.setdefault("explicit_time", True)
+                suggest_body.setdefault("requested_start", parsed_cfg.get("requested_start"))
+                if parsed_cfg.get("requested_end"):
+                    suggest_body.setdefault("requested_end", parsed_cfg.get("requested_end"))
+
+        # 3) call the existing internal suggest(...) function and return its result
+        try:
+            resp = suggest(suggest_body)
+            # suggest may return a JSONResponse on errors — pass it through
+            return resp
+        except Exception as e:
+            logger.exception("suggest_with_parser: internal suggest() call failed: %s", str(e))
+            return JSONResponse({"error": "suggest_internal_failed", "detail": str(e)}, status_code=500)
+
     except Exception as e:
-        return JSONResponse({"error": "suggest_call_failed", "detail": str(e)}, status_code=500)
+        logger.exception("suggest_with_parser: wrapper failed: %s", str(e))
+        return JSONResponse({"error": "wrapper_failed", "detail": str(e)}, status_code=500)

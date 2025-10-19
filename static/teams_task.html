@@ -185,12 +185,8 @@ try {
 }
 // --- END parser block ---
 
-
-    const r = await fetch(API_BASE + '/suggest', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify(body)
-    });
+    const r = await fetch(API_BASE + '/suggest/with_parser', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    
 
     if(!r.ok){
       const txt = await r.text().catch(()=>'{no body}');
