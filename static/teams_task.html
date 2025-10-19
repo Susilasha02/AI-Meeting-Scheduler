@@ -156,24 +156,35 @@ async function fetchSuggestions(){
     }
 
     // 3) Call /suggest (final producer)
-    // 👇 NEW: run parser first to detect explicit time (same flow as main UI)
+// --- START: run parser and forward explicit_time/requested_start when present ---
 try {
-  const pResp = await fetch(API_BASE + '/nlp/suggest', {
+  const parserRespRaw = await fetch(API_BASE + '/nlp/suggest', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ prompt: PROMPT })
   });
-  if (pResp.ok) {
-    const parsed = await pResp.json();
-    if (parsed && (parsed.explicit_time || parsed.requested_start)) {
-      body.explicit_time = true;
-      body.requested_start = parsed.requested_start;
-      body.time_zone = 'Asia/Kolkata';  // ensure consistent tz
+  if (parserRespRaw.ok) {
+    const parsed = await parserRespRaw.json();
+    // parser may return requested_start, window_start, or explicit_time flag
+    if (parsed && (parsed.explicit_time || parsed.requested_start || parsed.window_start)) {
+      const req = parsed.requested_start || parsed.window_start || null;
+      if (req) {
+        body.explicit_time = true;
+        body.requested_start = req;
+        // ensure timezone present like main UI
+        body.time_zone = 'Asia/Kolkata';
+        // also forward requested_end if parser provided it
+        if (parsed.requested_end) body.requested_end = parsed.requested_end;
+      }
     }
+  } else {
+    console.warn('/nlp/suggest returned non-OK status', parserRespRaw.status);
   }
-} catch (e) {
-  console.warn('Parser check failed', e);
+} catch (err) {
+  console.warn('parser check failed (non-fatal):', err);
 }
+// --- END parser block ---
+
 
     const r = await fetch(API_BASE + '/suggest', {
       method: 'POST',
