@@ -1986,65 +1986,56 @@ def ms_graph_create_event(body: dict = Body(...)):
     except Exception as e:
         return JSONResponse({"error":"server_error","detail": str(e)}, status_code=500)
 
-# add imports at top if not already present
 from fastapi import Body
 from fastapi.responses import JSONResponse
 
-@app.post("/suggest/with_parser")
-def suggest_with_parser(body: dict = Body(...)):
+@app.post("/suggest/with_parser_debug")
+def suggest_with_parser_debug(body: dict = Body(...)):
     """
-    Safe wrapper used by Teams Task Module: parse prompt server-side then call the
-    existing suggest(...) function and return its result. Does NOT modify existing endpoints.
-    Expected body shape: { prompt, user_key(optional), attendees(optional), today_only(optional) }
+    DEBUG ONLY: runs parser, builds suggest body, calls suggest() and returns:
+      { parser: {...}, suggest_request: {...}, suggest_response: <whatever suggest returned> }
+    Remove this endpoint after debugging.
     """
     prompt = (body.get("prompt") or "").strip()
     if not prompt:
-        return JSONResponse({"error": "missing_prompt"}, status_code=400)
+        return JSONResponse({"error":"missing_prompt"}, status_code=400)
 
+    # 1) call parser (internal)
     try:
-        # 1) produce a parsed config compatible with suggest()
-        try:
-            # parse_prompt(...) is defined in app.py and returns dict with
-            # window_start/window_end/duration_min/explicit_time/requested_start, etc.
-            parsed_cfg = parse_prompt(prompt, load_contacts())
-        except Exception as e:
-            # defensive fallback: log and fall back to empty parsed dict
-            logger.exception("suggest_with_parser: parse_prompt failed, continuing: %s", str(e))
-            parsed_cfg = {}
-
-        # 2) build suggest body: parsed config is base, override with any explicit fields from incoming body
-        suggest_body = {}
-        # Start with parsed defaults when available
-        if isinstance(parsed_cfg, dict):
-            suggest_body.update(parsed_cfg)
-
-        # Now let the incoming body override parsed values (attendees, explicit flags etc.)
-        # We intentionally copy keys commonly used by suggest()
-        for k in ("prompt", "user_key", "attendees", "duration_min", "buffer_min", "window_start", "window_end", "explicit_time", "requested_start", "requested_end", "time_zone", "today_only"):
-            if k in body and body[k] is not None:
-                suggest_body[k] = body[k]
-
-        # ensure time_zone exists (use LOCAL_TZ from env if not set)
-        suggest_body.setdefault("time_zone", os.getenv("LOCAL_TZ", "Asia/Kolkata"))
-
-        # If parse_prompt indicated explicit_time/requested_start but incoming body didn't provide explicit_time,
-        # preserve what parser returned
-        if parsed_cfg and isinstance(parsed_cfg, dict):
-            if parsed_cfg.get("explicit_time") and parsed_cfg.get("requested_start"):
-                suggest_body.setdefault("explicit_time", True)
-                suggest_body.setdefault("requested_start", parsed_cfg.get("requested_start"))
-                if parsed_cfg.get("requested_end"):
-                    suggest_body.setdefault("requested_end", parsed_cfg.get("requested_end"))
-
-        # 3) call the existing internal suggest(...) function and return its result
-        try:
-            resp = suggest(suggest_body)
-            # suggest may return a JSONResponse on errors — pass it through
-            return resp
-        except Exception as e:
-            logger.exception("suggest_with_parser: internal suggest() call failed: %s", str(e))
-            return JSONResponse({"error": "suggest_internal_failed", "detail": str(e)}, status_code=500)
-
+        parser_resp = parse_prompt(prompt, load_contacts())  # same helper used elsewhere
     except Exception as e:
-        logger.exception("suggest_with_parser: wrapper failed: %s", str(e))
-        return JSONResponse({"error": "wrapper_failed", "detail": str(e)}, status_code=500)
+        parser_resp = {"_parse_error": str(e)}
+
+    # 2) build suggest request same as production wrapper does
+    suggest_request = {}
+    if isinstance(parser_resp, dict):
+        suggest_request.update(parser_resp)
+
+    # allow caller to override parsed values
+    for k in ("prompt", "user_key", "attendees", "duration_min", "buffer_min", "window_start",
+              "window_end", "explicit_time", "requested_start", "requested_end", "time_zone", "today_only"):
+        if k in body and body[k] is not None:
+            suggest_request[k] = body[k]
+
+    # make sure time_zone present
+    suggest_request.setdefault("time_zone", os.getenv("LOCAL_TZ", "Asia/Kolkata"))
+
+    # if parser indicated explicit_time but everything else didn't override, preserve it
+    if isinstance(parser_resp, dict):
+        if parser_resp.get("explicit_time") and parser_resp.get("requested_start"):
+            suggest_request.setdefault("explicit_time", True)
+            suggest_request.setdefault("requested_start", parser_resp.get("requested_start"))
+
+    # 3) call internal suggest(...) and capture its result
+    try:
+        suggest_resp = suggest(suggest_request)
+    except Exception as e:
+        # if suggest raises, capture exception text
+        suggest_resp = {"_suggest_error": str(e)}
+
+    # Return everything so we can inspect it in the browser/network
+    return {
+        "parser": parser_resp,
+        "suggest_request": suggest_request,
+        "suggest_response": suggest_resp
+    }
