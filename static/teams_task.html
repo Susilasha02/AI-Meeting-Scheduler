@@ -156,6 +156,25 @@ async function fetchSuggestions(){
     }
 
     // 3) Call /suggest (final producer)
+    // 👇 NEW: run parser first to detect explicit time (same flow as main UI)
+try {
+  const pResp = await fetch(API_BASE + '/nlp/suggest', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt: PROMPT })
+  });
+  if (pResp.ok) {
+    const parsed = await pResp.json();
+    if (parsed && (parsed.explicit_time || parsed.requested_start)) {
+      body.explicit_time = true;
+      body.requested_start = parsed.requested_start;
+      body.time_zone = 'Asia/Kolkata';  // ensure consistent tz
+    }
+  }
+} catch (e) {
+  console.warn('Parser check failed', e);
+}
+
     const r = await fetch(API_BASE + '/suggest', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
