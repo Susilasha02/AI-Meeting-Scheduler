@@ -2064,6 +2064,9 @@ def ms_create_event(user_key: str, event_body: dict):
     r = requests.post("https://graph.microsoft.com/v1.0/me/events", headers=headers, json=event_body, timeout=10)
     r.raise_for_status()
     return r.json()
+
+
+
 @app.post("/ms/graph/create_event")
 def ms_graph_create_event(body: dict = Body(...)):
     """
@@ -2075,6 +2078,8 @@ def ms_graph_create_event(body: dict = Body(...)):
     Returns Graph event JSON on success.
     """
     user_key = (body.get("user_key") or "").lower()
+    print("🔍 create_event user_key:", user_key)
+    print("🔍 Current MS_TOKEN_STORE keys:", list(MS_TOKEN_STORE.keys()))
     if not user_key:
         return JSONResponse({"error": "missing_user_key"}, status_code=400)
     try:
@@ -2099,8 +2104,6 @@ def ms_graph_create_event(body: dict = Body(...)):
     except Exception as e:
         return JSONResponse({"error":"server_error","detail": str(e)}, status_code=500)
 
-from fastapi import Body
-from fastapi.responses import JSONResponse
 
 @app.post("/suggest/with_parser_debug")
 def suggest_with_parser_debug(body: dict = Body(...)):
