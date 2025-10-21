@@ -80,26 +80,185 @@ def ms_load_token(user_key: str) -> dict | None:
     data = json.loads(open(TOKEN_STORE, "r").read() or "{}")
     return data.get("ms_tokens", {}).get(user_key)
 
-def ms_refresh_token_if_needed(user_key: str) -> dict:
-    tok = ms_load_token(user_key)
-    if not tok:
+# ---------- improved MS token resolution + refresh helpers ----------
+def _candidate_ms_keys(user_key: str) -> list:
+    """
+    Produce a list of plausible keys to check for tokens (order matters: highest-confidence first).
+    - Accepts exact lowercased key.
+    - If key contains '#ext#' (guest UPN), we try:
+        * the raw UPN (as-is)
+        * the left side before '#ext#'
+        * a reconstructed email where we split the left side at the last '_' and turn it into local@domain (preserves digits)
+          e.g. "susilasha02_gmail.com#ext#@tenant.onmicrosoft.com" -> try "susilasha02@gmail.com"
+    - If input contains '@', we include that lowercased form.
+    - Deduplicates results.
+    """
+    if not user_key:
+        return []
+
+    k = user_key.strip().lower()
+    candidates = []
+    def add(x):
+        if x and x not in candidates:
+            candidates.append(x)
+
+    add(k)
+
+    # common cleanup if someone passed "mailto:..."
+    if k.startswith("mailto:"):
+        add(k.split(":", 1)[1])
+
+    # If it's a guest UPN with #ext#, try derived forms
+    if "#ext#" in k:
+        left = k.split("#ext#", 1)[0]
+        add(left)
+        # Try to reconstruct original email by treating the *last* underscore as delim before domain
+        # e.g. "susilasha02_gmail.com" -> "susilasha02@gmail.com"
+        m = re.match(r"^(.+)_([a-z0-9.-]+\.[a-z]{2,})$", left)
+        if m:
+            local = m.group(1)
+            domain = m.group(2)
+            probable = f"{local}@{domain}"
+            add(probable)
+
+    # If it's already an email, ensure we have it present
+    if "@" in k:
+        add(k)
+
+    # Also try removing any display-name-esque fragments (defensive)
+    # e.g., "Display Name <user@domain.com>" -> try extracting the email if angle brackets present
+    m2 = re.search(r"<([^>]+@[^>]+)>", user_key)
+    if m2:
+        add(m2.group(1).lower())
+
+    return candidates
+
+
+def _refresh_token_with_ms(refresh_token: str) -> dict | None:
+    """
+    Call MS token endpoint to refresh a refresh_token.
+    Returns the token response dict on success, else None.
+    """
+    if not refresh_token:
         return None
-    now = int(time.time())
-    if tok.get("_expires_at", 0) - now > 60:
-        return tok
-    # refresh
     payload = {
         "client_id": MS_CLIENT_ID,
         "scope": " ".join(MS_SCOPES),
-        "refresh_token": tok.get("refresh_token"),
+        "refresh_token": refresh_token,
         "grant_type": "refresh_token",
         "client_secret": MS_CLIENT_SECRET,
     }
-    r = requests.post(MS_TOKEN_URL, data=payload, timeout=10)
-    r.raise_for_status()
-    newtok = r.json()
-    ms_save_token(user_key, newtok)
-    return ms_load_token(user_key)
+    try:
+        rr = requests.post(MS_TOKEN_URL, data=payload, timeout=10)
+        rr.raise_for_status()
+        return rr.json()
+    except Exception as e:
+        # non-fatal: return None so caller can try other keys
+        print("⚠️ [_refresh_token_with_ms] refresh failed:", str(e))
+        return None
+
+
+def ms_refresh_token_if_needed(user_key: str) -> dict | None:
+    """
+    Robust token lookup + refresh:
+      - Try a list of candidate keys (derived from user_key).
+      - Consult both the in-memory MS_TOKEN_STORE and the on-disk token store (ms_load_token).
+      - If token near expiry, attempt refresh (and persist the refreshed response).
+      - Returns a token-like dict with at least 'access_token' and optionally 'refresh_token' and 'expires_at' (ISO).
+      - Returns None if no usable token found.
+    """
+    if not user_key:
+        return None
+
+    now_ts = int(time.time())
+    tried = []
+
+    candidates = _candidate_ms_keys(user_key)
+
+    # 1) Prefer in-memory MS_TOKEN_STORE (populated by callback / debug)
+    for key in candidates:
+        tried.append(key)
+        tok = MS_TOKEN_STORE.get(key)
+        if not tok:
+            continue
+
+        # token entry may store expires_at as ISO string; try to parse to epoch
+        exp_iso = tok.get("expires_at") or tok.get("_expires_at") or tok.get("_expires") or None
+        exp_ts = 0
+        if exp_iso:
+            try:
+                # if it's numeric epoch already
+                if isinstance(exp_iso, (int, float)):
+                    exp_ts = int(exp_iso)
+                else:
+                    exp_ts = int(pendulum.parse(exp_iso).int_timestamp())
+            except Exception:
+                exp_ts = 0
+
+        # if still valid > 60s, return
+        if exp_ts and (exp_ts - now_ts > 60):
+            return tok
+
+        # Otherwise attempt refresh using stored refresh_token
+        refresh_token = tok.get("refresh_token")
+        if refresh_token:
+            newresp = _refresh_token_with_ms(refresh_token)
+            if newresp:
+                # persist new token to disk & update in-memory entry
+                try:
+                    ms_save_token(key, newresp)  # write to TOKEN_STORE file in same format as ms_save_token expects
+                except Exception as e:
+                    print("⚠️ [ms_refresh_token_if_needed] ms_save_token failed:", str(e))
+                # update in-memory store to consistent shape
+                expires_in = int(newresp.get("expires_in", 3600))
+                new_entry = {
+                    "access_token": newresp.get("access_token"),
+                    "refresh_token": newresp.get("refresh_token"),
+                    "expires_at": pendulum.now("UTC").add(seconds=expires_in).to_iso8601_string()
+                }
+                MS_TOKEN_STORE[key] = new_entry
+                return new_entry
+        # if no refresh token available, continue to next candidate
+
+    # 2) Try the on-disk token store (ms_load_token)
+    for key in candidates:
+        tried.append(key)
+        tok = ms_load_token(key)
+        if not tok:
+            continue
+
+        # ms_load_token likely returns the shape saved by ms_save_token which sets '_expires_at' numeric
+        # accept either _expires_at (int) or expires_at (ISO str)
+        exp_ts = 0
+        if isinstance(tok.get("_expires_at"), (int, float)):
+            exp_ts = int(tok.get("_expires_at"))
+        else:
+            try:
+                exp_iso = tok.get("expires_at") or tok.get("_expires_at")
+                if exp_iso:
+                    exp_ts = int(pendulum.parse(str(exp_iso)).int_timestamp())
+            except Exception:
+                exp_ts = 0
+
+        if exp_ts and (exp_ts - now_ts > 60):
+            return tok
+
+        # try refresh using refresh_token present in stored tok (could be under 'refresh_token')
+        refresh_token = tok.get("refresh_token")
+        if refresh_token:
+            newresp = _refresh_token_with_ms(refresh_token)
+            if newresp:
+                try:
+                    ms_save_token(key, newresp)  # persist in same on-disk store
+                except Exception as e:
+                    print("⚠️ [ms_refresh_token_if_needed] ms_save_token failed (disk):", str(e))
+                # return the freshly saved on-disk copy
+                return ms_load_token(key)
+
+    # Nothing worked
+    print(f"⚠️ [ms_refresh_token_if_needed] no token found for '{user_key}' (tried keys: {tried})")
+    return None
+
 
 
 # --------- stores ----------
