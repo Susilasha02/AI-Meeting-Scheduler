@@ -1223,8 +1223,8 @@ def nlp_suggest(body: dict = Body(...)):
     """
     try:
         import importlib, sys
-        if "app" in sys.modules:
-            importlib.reload(sys.modules["app"])
+        '''if "app" in sys.modules:
+            importlib.reload(sys.modules["app"])'''
 
         from app import parse_prompt_to_window  # noqa: E402
         prompt = (body.get("prompt","") or "").strip()
@@ -2269,9 +2269,13 @@ def ms_graph_create_event(body: dict = Body(...)):
       - subject, attendees (list), body (string)
     Returns Graph event JSON on success.
     """
-    print("🔍 create_event hostname:", socket.gethostname(), "pid:", os.getpid(), "user_key:", user_key)
+    
 
     user_key = (body.get("user_key") or "").lower()
+    try:
+        print("🔍 create_event hostname:", socket.gethostname(), "pid:", os.getpid(), "user_key_present:", bool(user_key))
+    except Exception:
+        pass
     print("🔍 create_event user_key:", user_key)
     print("🔍 Current MS_TOKEN_STORE keys:", list(MS_TOKEN_STORE.keys()))
     if not user_key:
