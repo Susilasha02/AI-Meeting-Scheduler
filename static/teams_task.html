@@ -44,22 +44,9 @@
   </div>
 
 <script>
-/*
-  teams_task.html behaviour:
-   - Query params:
-       prompt (required)
-       user_key (recommended) — email/UPN used to look up ms token
-       attendees (optional, comma separated)
-       today_only (optional, "1" or "true")
-   - Calls /suggest with prompt + user_key to retrieve final candidates (same as main UI)
-   - Renders up to the returned suggestions (we handle either array or { slots: [...] } style)
-   - Allows editing subject and attendees, and posts to /ms/graph/create_event with user_key
-   - If MS is not connected (server returns 401/not_connected), shows Connect button which goes to /ms/auth/start?next=<current page>
-*/
-
 const Q = new URLSearchParams(location.search);
 const PROMPT = Q.get('prompt') || '';
-const USER_KEY = Q.get('user_key') || '';
+const USER_KEY = Q.get('user_key') || Q.get('user') || '';
 const ATT_Q = Q.get('attendees') || '';
 const TODAY_ONLY = Q.get('today_only') || '';
 const API_BASE = location.origin.replace(/\/$/, '');
@@ -74,7 +61,7 @@ const statusEl = document.getElementById('status');
 const subjectInput = document.getElementById('subject');
 const attendeesInput = document.getElementById('attendees');
 
-let SUGGESTIONS = [];   // canonical array of { start, end, human, slot? ... }
+let SUGGESTIONS = [];
 let SELECTED_INDEX = null;
 
 attendeesInput.value = ATT_Q.replace(/\+/g, ' ');
@@ -95,15 +82,19 @@ function fmtHuman(s){
 }
 
 function canonicalizeList(resp){
-  // resp may already be an array, or may be object with .slots, or parser result etc.
   if(!resp) return [];
   if(Array.isArray(resp)) return resp;
   if(resp.slots && Array.isArray(resp.slots)) return resp.slots;
-  // sometimes server returns array-like object; attempt to extract keys
   if(resp.length && typeof resp.length === 'number') return Array.from(resp);
   return [];
 }
 
+/*
+  fetchSuggestions: keep same behavior as main UI:
+   1) call /nlp/suggest to parse prompt (non-fatal)
+   2) if parser indicates explicit_time / requested_start -> forward to /suggest
+   3) call /suggest (production) with time_zone set (Asia/Kolkata) so output matches main UI
+*/
 async function fetchSuggestions(){
   if(!PROMPT){
     loadingEl.textContent = "No prompt provided.";
@@ -116,7 +107,7 @@ async function fetchSuggestions(){
   showStatus('');
 
   try{
-    // 1) Run parser first to detect explicit_time / requested_start
+    // STEP 1: run parser wrapper (nlp/suggest). Non-fatal — we fall back to /suggest without parser if this fails.
     let parserResp = null;
     try{
       const pResp = await fetch(API_BASE + '/nlp/suggest', {
@@ -124,69 +115,47 @@ async function fetchSuggestions(){
         headers: {'Content-Type':'application/json'},
         body: JSON.stringify({ prompt: PROMPT })
       });
-      if(pResp.ok) parserResp = await pResp.json();
-      else parserResp = null;
+      if(pResp.ok){
+        parserResp = await pResp.json();
+      } else {
+        // non-fatal
+        parserResp = null;
+      }
     }catch(e){
-      // parser failing is non-fatal; we'll still call /suggest with prompt
-      console.warn('parser error', e);
+      console.warn('parser call failed (non-fatal)', e);
       parserResp = null;
     }
 
-    // Build /suggest request body (force LOCAL_TZ so task UI uses same timezone as main UI)
+    // STEP 2: build /suggest request body
     const body = {
       prompt: PROMPT,
-      time_zone: 'Asia/Kolkata',            // keep same as server LOCAL_TZ
+      time_zone: 'Asia/Kolkata',            // ensure same tz as main UI
       today_only: (TODAY_ONLY === '1' || TODAY_ONLY === 'true'),
     };
     if(USER_KEY) body.user_key = USER_KEY;
-    // prefer the attendees input field over query param if user edited it in UI
-    if(attendeesInput.value) body.attendees = attendeesInput.value.split(',').map(s=>s.trim()).filter(Boolean);
-    else if(ATT_Q) body.attendees = ATT_Q.split(',').map(s=>s.trim()).filter(Boolean);
+    // attendees: prefer edited field
+    if(attendeesInput.value){
+      body.attendees = attendeesInput.value.split(',').map(s=>s.trim()).filter(Boolean);
+    } else if(ATT_Q){
+      body.attendees = ATT_Q.split(',').map(s=>s.trim()).filter(Boolean);
+    }
 
-    // 2) If parser says explicit_time, forward requested_start + explicit flag
-    // This ensures /suggest tightens around requested_start (so you get the 2pm slot)
-    if(parserResp && (parserResp.explicit_time || parserResp.requested_start || parserResp.window_start)){
+    // If parser found a requested_start / explicit_time, forward it to /suggest so we get identical results
+    if(parserResp && (parserResp.requested_start || parserResp.explicit_time || parserResp.window_start)){
       const req = parserResp.requested_start || parserResp.window_start || null;
       if(req){
-        body.explicit_time = true;
+        body.explicit_time = !!parserResp.explicit_time || true;
         body.requested_start = req;
-        // If parser returned a window_end, forward it too
         if(parserResp.requested_end) body.requested_end = parserResp.requested_end;
       }
     }
 
-    // 3) Call /suggest (final producer)
-// --- START: run parser and forward explicit_time/requested_start when present ---
-try {
-  const parserRespRaw = await fetch(API_BASE + '/suggest/with_parser', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt: PROMPT })
-  });
-  if (parserRespRaw.ok) {
-    const parsed = await parserRespRaw.json();
-    // parser may return requested_start, window_start, or explicit_time flag
-    if (parsed && (parsed.explicit_time || parsed.requested_start || parsed.window_start)) {
-      const req = parsed.requested_start || parsed.window_start || null;
-      if (req) {
-        body.explicit_time = true;
-        body.requested_start = req;
-        // ensure timezone present like main UI
-        body.time_zone = 'Asia/Kolkata';
-        // also forward requested_end if parser provided it
-        if (parsed.requested_end) body.requested_end = parsed.requested_end;
-      }
-    }
-  } else {
-    console.warn('/nlp/suggest returned non-OK status', parserRespRaw.status);
-  }
-} catch (err) {
-  console.warn('parser check failed (non-fatal):', err);
-}
-// --- END parser block ---
-
-    const r = await fetch(API_BASE + '/suggest/with_parser', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-    
+    // STEP 3: call production /suggest (this is the same endpoint main UI uses)
+    const r = await fetch(API_BASE + '/suggest', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
 
     if(!r.ok){
       const txt = await r.text().catch(()=>'{no body}');
@@ -237,34 +206,20 @@ function renderSlots(){
     slotsEl.appendChild(el);
   });
 
-  // attach handlers
-  slotsEl.querySelectorAll('button[data-idx]').forEach(b=>{
-    b.onclick = (ev)=>{
-      const idx = Number(ev.currentTarget.getAttribute('data-idx'));
-      selectSlot(idx);
-    };
-  });
-  slotsEl.querySelectorAll('button[data-idx-view]').forEach(b=>{
-    b.onclick = (ev)=>{
-      const idx = Number(ev.currentTarget.getAttribute('data-idx-view'));
-      alert('Raw candidate JSON:\\n' + JSON.stringify(SUGGESTIONS[idx], null, 2));
-    };
-  });
+  slotsEl.querySelectorAll('button[data-idx]').forEach(b=>{ b.onclick = (ev)=>{ const idx = Number(ev.currentTarget.getAttribute('data-idx')); selectSlot(idx); }; });
+  slotsEl.querySelectorAll('button[data-idx-view]').forEach(b=>{ b.onclick = (ev)=>{ const idx = Number(ev.currentTarget.getAttribute('data-idx-view')); alert('Raw candidate JSON:\\n' + JSON.stringify(SUGGESTIONS[idx], null, 2)); }; });
 
-  // select first by default
   if(SUGGESTIONS.length>0) selectSlot(0);
 }
 
 function selectSlot(idx){
   SELECTED_INDEX = idx;
-  // visually mark (simple): scroll into view and highlight background briefly
   const children = Array.from(slotsEl.children);
   children.forEach((c,i)=> c.style.boxShadow = (i===idx) ? '0 6px 20px rgba(79,70,229,0.08)' : 'none');
   showStatus('Selected slot: ' + (SUGGESTIONS[idx].human || (SUGGESTIONS[idx].start + ' → ' + SUGGESTIONS[idx].end)));
 }
 
 function openConnectMs(){
-  // redirect user to ms auth with next back to current page (preserve prompt + user_key)
   const next = encodeURIComponent(location.pathname + location.search);
   window.location.href = API_BASE + '/ms/auth/start?next=' + next;
 }
@@ -299,18 +254,14 @@ createBtn.addEventListener('click', async ()=>{
     const data = await r.json().catch(()=>null);
     if(r.ok){
       showStatus('Event created successfully.', false);
-      // show join link if present
       const link = (data && (data.onlineMeeting && data.onlineMeeting.joinUrl || data.webLink || data.htmlLink)) || '';
       if(link){
-        const msg = 'Event created. Join link:\\n' + link;
-        alert(msg);
+        alert('Event created. Join link:\\n' + link);
       } else {
         alert('Event created successfully.');
       }
-      // attempt to notify parent (Teams) to close Task Module if iframe parent supports postMessage
       try{ parent.postMessage({ action: 'close', result: data || {} }, '*'); }catch(e){}
     } else {
-      // server returned non-200: show message and give connect option if not_connected
       if(data && data.error === 'not_connected'){
         showStatus('Microsoft account not connected for this user. Click Connect Microsoft to sign in.', true);
       } else if(data && data.error === 'missing_user_key'){
@@ -328,7 +279,6 @@ createBtn.addEventListener('click', async ()=>{
   }
 });
 
-// bootstrap
 fetchSuggestions();
 </script>
 </body>
