@@ -9,6 +9,7 @@ import urllib.parse
 import logging
 import requests
 import time
+import socket
 from typing import List, Dict, Tuple
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -2072,6 +2073,8 @@ def ms_auth_callback(code: str = Query(...), state: str | None = Query(None)):
     Exchange code for tokens, fetch /me to identify user, store tokens in MS_TOKEN_STORE,
     then redirect back to `state` (next) and append user_key query param so UI knows which user is connected.
     """
+    print("🟣 [CALLBACK] hostname:", socket.gethostname(), "pid:", os.getpid())
+
 
     print("🟣 [CALLBACK] Entered Microsoft auth callback")
 
@@ -2145,7 +2148,7 @@ def ms_auth_callback(code: str = Query(...), state: str | None = Query(None)):
         "refresh_token": token_resp.get("refresh_token"),
         "expires_at": expires_at,
     }
-
+    
     # ---------- Persist & populate token under multiple candidate keys ----------
     def _derive_ms_candidate_keys_from_callback(primary_key: str, me_obj: dict | None):
         """
@@ -2251,12 +2254,10 @@ def ms_create_event(user_key: str, event_body: dict):
     }
     # optionally ask Graph to create online meeting:
     # event_body["onlineMeetingProvider"] = "teamsForBusiness"
-
     r = requests.post("https://graph.microsoft.com/v1.0/me/events", headers=headers, json=event_body, timeout=10)
+    if not r.ok:
+        print("🔴 [GRAPH] create_event failed status:", r.status_code, "body:", r.text)
     r.raise_for_status()
-    return r.json()
-
-
 
 @app.post("/ms/graph/create_event")
 def ms_graph_create_event(body: dict = Body(...)):
@@ -2268,6 +2269,8 @@ def ms_graph_create_event(body: dict = Body(...)):
       - subject, attendees (list), body (string)
     Returns Graph event JSON on success.
     """
+    print("🔍 create_event hostname:", socket.gethostname(), "pid:", os.getpid(), "user_key:", user_key)
+
     user_key = (body.get("user_key") or "").lower()
     print("🔍 create_event user_key:", user_key)
     print("🔍 Current MS_TOKEN_STORE keys:", list(MS_TOKEN_STORE.keys()))
