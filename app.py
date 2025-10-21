@@ -25,6 +25,7 @@ from google_auth_oauthlib.flow import Flow
 from googleapiclient.errors import HttpError
 from google.auth.transport.requests import AuthorizedSession
 
+from fastapi import Query
 from dateutil import parser as dparse
 import pendulum
 
@@ -50,6 +51,12 @@ MS_SCOPES = ["openid","profile","offline_access","User.Read","Calendars.ReadWrit
 MS_AUTH_URL = f"https://login.microsoftonline.com/{MS_TENANT}/oauth2/v2.0/authorize"
 MS_TOKEN_URL = f"https://login.microsoftonline.com/{MS_TENANT}/oauth2/v2.0/token"
 
+
+
+DEBUG_SECRET = os.getenv("DEBUG_SECRET", "check123")
+
+
+MS_TOKEN_STORE = {}
 # token store helpers (re-using token_store.json style)
 def ms_save_token(user_key: str, token_response: dict):
     """
@@ -2045,3 +2052,9 @@ def timezone_check():
     now_local = pendulum.now(os.getenv("TIME_ZONE", "UTC"))
     return {"TIME_ZONE": os.getenv("TIME_ZONE"), "LOCAL_TZ": os.getenv("LOCAL_TZ"), "now_local": str(now_local)}
 
+@app.get("/ms/debug/tokens")
+def debug_tokens(secret: str = Query(None)):
+    if secret != DEBUG_SECRET:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    safe = {k: {"expires_at": v.get("expires_at")} for k, v in MS_TOKEN_STORE.items()}
+    return {"tokens": safe}
