@@ -2502,3 +2502,30 @@ def debug_tokens(secret: str = Query(None)):
             disk_tokens = {"_error": str(e)}
 
     return {"in_memory": inmem, "on_disk": disk_tokens}
+@app.get("/ms/debug/token_raw")
+def debug_token_raw(key: str = Query(...), secret: str = Query(None)):
+    """
+    Temporary debug — returns the raw stored token object for `key`.
+    Usage: /ms/debug/token_raw?secret=check123&key=<user_key>
+    DO NOT leave this in production.
+    """
+    if secret != DEBUG_SECRET:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+
+    out = {"in_memory": None, "on_disk": None}
+    # in-memory
+    tok = MS_TOKEN_STORE.get(key)
+    if tok:
+        out["in_memory"] = {k: (v if k != "access_token" and k != "refresh_token" else "<hidden>") for k, v in tok.items()}
+    # on-disk
+    if os.path.exists(TOKEN_STORE):
+        try:
+            data = json.loads(open(TOKEN_STORE, "r").read() or "{}")
+            ms_ts = data.get("ms_tokens", {})
+            v = ms_ts.get(key)
+            if v:
+                # return all non-sensitive fields plus scope if present
+                out["on_disk"] = {k: (v if k not in ("access_token","refresh_token","id_token") else "<hidden>") for k,v in v.items()}
+        except Exception as e:
+            out["on_disk"] = {"_error": str(e)}
+    return out
