@@ -2352,9 +2352,32 @@ def timezone_check():
     now_local = pendulum.now(os.getenv("TIME_ZONE", "UTC"))
     return {"TIME_ZONE": os.getenv("TIME_ZONE"), "LOCAL_TZ": os.getenv("LOCAL_TZ"), "now_local": str(now_local)}
 
+
 @app.get("/ms/debug/tokens")
 def debug_tokens(secret: str = Query(None)):
     if secret != DEBUG_SECRET:
         return JSONResponse({"error": "forbidden"}, status_code=403)
-    safe = {k: {"expires_at": v.get("expires_at")} for k, v in MS_TOKEN_STORE.items()}
-    return {"tokens": safe}
+
+    # In-memory tokens
+    inmem = {k: {"expires_at": v.get("expires_at")} for k, v in MS_TOKEN_STORE.items()}
+
+    # Disk tokens (ms_tokens section)
+    disk_tokens = {}
+    if os.path.exists(TOKEN_STORE):
+        try:
+            data = json.loads(open(TOKEN_STORE, "r").read() or "{}")
+            ms_ts = data.get("ms_tokens", {})
+            for k, v in ms_ts.items():
+                # token saved by ms_save_token stores _expires_at etc. Convert to iso if numeric
+                expires = v.get("expires_at") or v.get("_expires_at") or None
+                # if numeric epoch
+                if isinstance(expires, (int, float)):
+                    try:
+                        expires = pendulum.from_timestamp(int(expires), tz="UTC").to_iso8601_string()
+                    except Exception:
+                        pass
+                disk_tokens[k] = {"expires_at": expires}
+        except Exception as e:
+            disk_tokens = {"_error": str(e)}
+
+    return {"in_memory": inmem, "on_disk": disk_tokens}
