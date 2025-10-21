@@ -2259,7 +2259,7 @@ def ms_create_event(user_key: str, event_body: dict):
         print("🔴 [GRAPH] create_event failed status:", r.status_code, "body:", r.text)
     r.raise_for_status()
 
-@app.post("/ms/graph/create_event")
+'''@app.post("/ms/graph/create_event")
 def ms_graph_create_event(body: dict = Body(...)):
     """
     Body expected:
@@ -2300,8 +2300,122 @@ def ms_graph_create_event(body: dict = Body(...)):
     except requests.HTTPError as he:
         return JSONResponse({"error":"graph_error","detail": str(he), "response": getattr(he.response, "text", "")}, status_code=500)
     except Exception as e:
-        return JSONResponse({"error":"server_error","detail": str(e)}, status_code=500)
+        return JSONResponse({"error":"server_error","detail": str(e)}, status_code=500)'''
 
+@app.post("/ms/graph/create_event")
+def ms_graph_create_event(body: dict = Body(...)):
+    """
+    Body expected:
+      - user_key: email (or "ms_user")
+      - start, end, subject, attendees, body
+    Enhanced debug + safe retry on token refresh.
+    """
+    user_key = (body.get("user_key") or "").lower()
+    try:
+        print("🔍 create_event hostname:", socket.gethostname(), "pid:", os.getpid(), "user_key_present:", bool(user_key))
+    except Exception:
+        pass
+
+    if not user_key:
+        return JSONResponse({"error": "missing_user_key"}, status_code=400)
+
+    # Basic inputs
+    start = body.get("start")
+    end = body.get("end")
+    subject = body.get("subject", "Meeting scheduled via AI scheduler")
+    attendees = body.get("attendees", [])
+    content = body.get("body", "")
+
+    # helper to perform Graph calls using a token dict
+    def _graph_get_me(access_token: str):
+        hdr = {"Authorization": "Bearer " + access_token}
+        try:
+            r = requests.get("https://graph.microsoft.com/v1.0/me", headers=hdr, timeout=10)
+            return r.status_code, r.text
+        except Exception as e:
+            return None, f"exception:{str(e)}"
+
+    def _graph_create_event_with_token(access_token: str, ev_body: dict):
+        hdr = {"Authorization": "Bearer " + access_token, "Content-Type": "application/json"}
+        try:
+            r = requests.post("https://graph.microsoft.com/v1.0/me/events", headers=hdr, json=ev_body, timeout=10)
+            return r.status_code, r.text
+        except Exception as e:
+            return None, f"exception:{str(e)}"
+
+    # Build Graph event body (timeZone uses your LOCAL_TZ)
+    event_body = {
+        "subject": subject,
+        "body": {"contentType": "HTML", "content": content},
+        "start": {"dateTime": start, "timeZone": LOCAL_TZ},
+        "end": {"dateTime": end, "timeZone": LOCAL_TZ},
+        "attendees": [{"emailAddress": {"address": a, "name": a.split("@")[0]}, "type": "required"} for a in attendees],
+        "isOnlineMeeting": True,
+        "onlineMeetingProvider": "teamsForBusiness"
+    }
+
+    # Attempt to resolve & refresh token (this uses your existing function)
+    try:
+        tok = ms_refresh_token_if_needed(user_key)
+    except Exception as e:
+        print("⚠️ [create_event] ms_refresh_token_if_needed raised:", str(e))
+        tok = None
+
+    if not tok:
+        # nothing usable found
+        print(f"⚠️ [create_event] no token found for user_key={user_key}")
+        return JSONResponse({"error": "not_connected_ms"}, status_code=401)
+
+    # Log token presence (not the token value)
+    try:
+        print("🔑 [create_event] token fields available:", list(tok.keys()))
+    except Exception:
+        pass
+
+    access_token = tok.get("access_token")
+    if not access_token:
+        print("⚠️ [create_event] access_token missing in token entry for", user_key)
+        return JSONResponse({"error": "no_access_token"}, status_code=401)
+
+    # 1) quick validity check: GET /me
+    status, body_text = _graph_get_me(access_token)
+    print(f"🔎 [GRAPH CHECK] GET /me status={status} body={body_text}")
+
+    # If 401 or None, attempt a refresh attempt (one-shot) and retry once
+    if status == 401 or status is None:
+        print("🔁 [GRAPH CHECK] token invalid or expired — attempting refresh and retry")
+        # Force refresh: try to read stored refresh_token and refresh token via token endpoint
+        # We call ms_refresh_token_if_needed(user_key) again which will attempt refresh if needed.
+        try:
+            tok2 = ms_refresh_token_if_needed(user_key)
+        except Exception as e:
+            print("⚠️ [create_event] forced refresh raised:", str(e))
+            tok2 = None
+
+        if tok2 and tok2.get("access_token"):
+            access_token = tok2.get("access_token")
+            print("🔁 [GRAPH CHECK] retrying GET /me with refreshed token")
+            status, body_text = _graph_get_me(access_token)
+            print(f"🔎 [GRAPH CHECK] (after refresh) GET /me status={status} body={body_text}")
+        else:
+            print("⚠️ [create_event] refresh failed or no new token available")
+
+    # If still not OK, return diagnostic
+    if status != 200:
+        print(f"🔴 [GRAPH] GET /me failed before create_event; aborting. status={status} body={body_text}")
+        return JSONResponse({"error": "graph_error", "detail": f"GET /me failed (status={status})", "response": body_text}, status_code=500)
+
+    # Proceed to create event
+    status_post, post_body = _graph_create_event_with_token(access_token, event_body)
+    if status_post is None or status_post >= 400:
+        print(f"🔴 [GRAPH] create_event failed status: {status_post} body: {post_body}")
+        return JSONResponse({"error": "graph_error", "detail": str(status_post), "response": post_body}, status_code=500)
+
+    # Success - return Graph response body parsed if JSON
+    try:
+        return json.loads(post_body)
+    except Exception:
+        return {"raw_response": post_body}
 
 @app.post("/suggest/with_parser_debug")
 def suggest_with_parser_debug(body: dict = Body(...)):
