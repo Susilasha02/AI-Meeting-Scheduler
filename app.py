@@ -2381,6 +2381,16 @@ def ms_graph_create_event(body: dict = Body(...)):
     status, body_text = _graph_get_me(access_token)
     print(f"🔎 [GRAPH CHECK] GET /me status={status} body={body_text}")
 
+    try:
+        r_cal = requests.get(
+            "https://graph.microsoft.com/v1.0/me/calendars",
+            headers={"Authorization": "Bearer " + access_token},
+            timeout=10,
+        )
+        print(f"🔎 [GRAPH CHECK] GET /me/calendars status={r_cal.status_code} body={r_cal.text}")
+    except Exception as e:
+        print("⚠️ [GRAPH CHECK] GET /me/calendars exception:", str(e))
+
     # If 401 or None, attempt a refresh attempt (one-shot) and retry once
     if status == 401 or status is None:
         print("🔁 [GRAPH CHECK] token invalid or expired — attempting refresh and retry")
