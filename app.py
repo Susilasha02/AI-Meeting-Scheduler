@@ -2066,7 +2066,6 @@ def ms_auth_start(next: str = "/ui/"):
 
 # Make sure MS_TOKEN_STORE exists at module scope:
 # MS_TOKEN_STORE = {}
-
 @app.get("/ms/auth/callback")
 def ms_auth_callback(code: str = Query(...), state: str | None = Query(None)):
     """
@@ -2133,57 +2132,90 @@ def ms_auth_callback(code: str = Query(...), state: str | None = Query(None)):
     user_key = user_email.lower()
     print("🟣 [CALLBACK] Determined user_key:", user_key)
 
-    # build token entry to store
+    # compute expires_at ISO
     try:
         expires_in = int(token_resp.get("expires_in", 3600))
     except Exception:
         expires_in = 3600
     expires_at = pendulum.now("UTC").add(seconds=int(expires_in)).to_iso8601_string()
 
+    # token_entry (normalized view)
     token_entry = {
         "access_token": token_resp.get("access_token"),
         "refresh_token": token_resp.get("refresh_token"),
         "expires_at": expires_at,
-        # keep raw token response for debugging if needed (optional)
-        # "raw": token_resp
     }
 
-    # store in global MS_TOKEN_STORE (module-level dict)
-    try:
+    # ---------- Persist & populate token under multiple candidate keys ----------
+    def _derive_ms_candidate_keys_from_callback(primary_key: str, me_obj: dict | None):
+        """
+        Derive plausible alternative keys from the callback-determined primary_key and /me info.
+        Examples handled generically and without hardcoding:
+          - the original user_key
+          - mail (if present)
+          - userPrincipalName (if present)
+          - left part of UPN if '#ext#' present
+          - reconstructed email if left part looks like 'local_domain.com' (keeps digits)
+          - any email found in angle brackets
+        """
+        keys = []
+        pk = (primary_key or "").strip().lower()
+        if pk:
+            keys.append(pk)
+
+        if me_obj:
+            mail = (me_obj.get("mail") or "").strip().lower()
+            upn  = (me_obj.get("userPrincipalName") or "").strip().lower()
+            if mail and mail not in keys:
+                keys.append(mail)
+            if upn and upn not in keys:
+                keys.append(upn)
+
+        # handle guest UPNs with '#ext#' -> try left side and reconstruct email by last underscore
+        if "#ext#" in pk:
+            left = pk.split("#ext#", 1)[0]
+            if left and left not in keys:
+                keys.append(left)
+            m = re.match(r"^(.+)_([a-z0-9.\-]+\.[a-z]{2,})$", left)
+            if m:
+                probable = f"{m.group(1)}@{m.group(2)}"
+                if probable not in keys:
+                    keys.append(probable)
+
+        # extract email from angle-bracket patterns if present
+        m2 = re.search(r"<([^>]+@[^>]+)>", primary_key)
+        if m2:
+            candidate = m2.group(1).strip().lower()
+            if candidate not in keys:
+                keys.append(candidate)
+
+        return keys
+
+    candidate_keys = _derive_ms_candidate_keys_from_callback(user_key, me)
+
+    saved_any = []
+    for k in candidate_keys:
+        try:
+            # Persist raw token response under ms_tokens -> ms_save_token will write to TOKEN_STORE
+            ms_save_token(k, token_resp)
+            # keep the in-memory copy too for immediate use
+            MS_TOKEN_STORE[k] = {
+                "access_token": token_resp.get("access_token"),
+                "refresh_token": token_resp.get("refresh_token"),
+                "expires_at": expires_at
+            }
+            saved_any.append(k)
+            print(f"🟢 [CALLBACK] Saved MS token under key: {k}")
+        except Exception as e:
+            print(f"⚠️ [CALLBACK] Failed to save token under {k}: {e}")
+
+    if not saved_any:
+        # fallback to at least set in-memory so current flow might succeed
         MS_TOKEN_STORE[user_key] = token_entry
-        # handle external Microsoft UPNs that look like susilasha_gmail.com#EXT#@susilashagmail.onmicrosoft.com
-        if "#ext#" in user_key and user_key.endswith(".onmicrosoft.com"):
-            # derive probable real email: susilasha@gmail.com
-            try:
-                base = user_key.split("#ext#")[0]
-                if "_gmail.com" in base:
-                    probable_email = base.replace("_gmail.com", "@gmail.com")
-                    MS_TOKEN_STORE[probable_email] = token_entry
-                    print(f"🟢 [CALLBACK] Also stored token for probable Gmail alias: {probable_email}")
-            except Exception as e:
-                print("⚠️ [CALLBACK] Alias parse error:", str(e))
-
-                print(f"🟢 [CALLBACK] Stored token for key: {user_key}")
-    except Exception as e:
-        print("🔴 [CALLBACK] Failed to store token:", str(e))
-        return JSONResponse({"error": "store_failed", "detail": str(e)}, status_code=500)
-
-    # Also store under alternate email (mail vs userPrincipalName) if both present to avoid lookup mismatch
-    try:
-        if me:
-            mail = me.get("mail")
-            upn = me.get("userPrincipalName")
-            if mail and upn:
-                mail_l = mail.lower()
-                upn_l = upn.lower()
-                # ensure both keys point to same token entry
-                MS_TOKEN_STORE[mail_l] = token_entry
-                MS_TOKEN_STORE[upn_l] = token_entry
-                print(f"🟢 [CALLBACK] Stored token under both mail ({mail_l}) and upn ({upn_l})")
-    except Exception as e:
-        print("⚠️ [CALLBACK] Warning storing alternate keys:", str(e))
+        print(f"⚠️ [CALLBACK] Persist attempts failed; kept token in-memory under {user_key}")
 
     print("✅ [CALLBACK] Current MS_TOKEN_STORE keys:", list(MS_TOKEN_STORE.keys()))
+    # -------------------------------------------------------------------------
 
     # build redirect back URL (state contains 'next' originally)
     next_url = urllib.parse.unquote(state) if state else "/ui/"
