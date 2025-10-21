@@ -1992,7 +1992,19 @@ def ms_auth_callback(code: str = Query(...), state: str | None = Query(None)):
     # store in global MS_TOKEN_STORE (module-level dict)
     try:
         MS_TOKEN_STORE[user_key] = token_entry
-        print(f"🟢 [CALLBACK] Stored token for key: {user_key}")
+        # handle external Microsoft UPNs that look like susilasha_gmail.com#EXT#@susilashagmail.onmicrosoft.com
+        if "#ext#" in user_key and user_key.endswith(".onmicrosoft.com"):
+            # derive probable real email: susilasha@gmail.com
+            try:
+                base = user_key.split("#ext#")[0]
+                if "_gmail.com" in base:
+                    probable_email = base.replace("_gmail.com", "@gmail.com")
+                    MS_TOKEN_STORE[probable_email] = token_entry
+                    print(f"🟢 [CALLBACK] Also stored token for probable Gmail alias: {probable_email}")
+            except Exception as e:
+                print("⚠️ [CALLBACK] Alias parse error:", str(e))
+
+                print(f"🟢 [CALLBACK] Stored token for key: {user_key}")
     except Exception as e:
         print("🔴 [CALLBACK] Failed to store token:", str(e))
         return JSONResponse({"error": "store_failed", "detail": str(e)}, status_code=500)
