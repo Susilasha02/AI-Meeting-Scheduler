@@ -2039,3 +2039,9 @@ def suggest_with_parser_debug(body: dict = Body(...)):
         "suggest_request": suggest_request,
         "suggest_response": suggest_resp
     }
+@app.get("/timezone_check")
+def timezone_check():
+    import pendulum
+    now_local = pendulum.now(os.getenv("TIME_ZONE", "UTC"))
+    return {"TIME_ZONE": os.getenv("TIME_ZONE"), "LOCAL_TZ": os.getenv("LOCAL_TZ"), "now_local": str(now_local)}
+
