@@ -2539,3 +2539,18 @@ def debug_token_raw(key: str = Query(...), secret: str = Query(None)):
         except Exception as e:
             out["on_disk"] = {"_error": str(e)}
     return out
+@app.get("/_debug/export_ms_tokens")
+async def _export_ms_tokens(request: Request):
+    # require secret query param
+    secret = request.query_params.get("secret")
+    if not DEBUG_SECRET or secret != DEBUG_SECRET:
+        raise HTTPException(status_code=403, detail="forbidden")
+    try:
+        # reference the runtime token store variable used by your app
+        # If your app uses a different name, change MS_TOKEN_STORE below.
+        from store import MS_TOKEN_STORE   # adjust import if needed
+    except Exception as e:
+        return JSONResponse({"error": "token_store_not_found", "detail": str(e)}, status_code=500)
+
+    # Return a copy (avoid leaking internal objects)
+    return JSONResponse(MS_TOKEN_STORE)
