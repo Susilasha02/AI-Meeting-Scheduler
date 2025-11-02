@@ -1191,14 +1191,23 @@ def auth_start(request: Request):
         return RedirectResponse(auth_url)
     except Exception as e:
         return JSONResponse({"error": "oauth_setup_failed", "detail": str(e)}, status_code=500)
+from fastapi.responses import RedirectResponse, JSONResponse
+import urllib.parse
 
 @app.get("/auth/callback")
 def auth_callback(code: str, state: str | None = None):
+    # exchange token and save creds (existing logic)
     flow = build_flow()
     flow.fetch_token(code=code)
     creds = flow.credentials
     save_creds(ORGANIZER_ID, creds)
-    return RedirectResponse(state) if state else JSONResponse({"connected": True})
+
+    # After saving tokens, redirect to a small page that will either:
+    #  - notify Teams and close the popup (if this was a Teams popup), or
+    #  - redirect the browser to the original 'state' (next) for non-Teams flows.
+    next_url = state or "/ui/"
+    return RedirectResponse(url=f"/teams/google/close?next={urllib.parse.quote(next_url, safe='')}")
+
 
 # Contacts
 @app.post("/contacts/add")
@@ -2259,49 +2268,6 @@ def ms_create_event(user_key: str, event_body: dict):
         print("🔴 [GRAPH] create_event failed status:", r.status_code, "body:", r.text)
     r.raise_for_status()
 
-'''@app.post("/ms/graph/create_event")
-def ms_graph_create_event(body: dict = Body(...)):
-    """
-    Body expected:
-      - user_key: email (or "ms_user")
-      - start: ISO string (with offset)  e.g. "2025-10-18T09:30:00+05:30"
-      - end: ISO string
-      - subject, attendees (list), body (string)
-    Returns Graph event JSON on success.
-    """
-    
-
-    user_key = (body.get("user_key") or "").lower()
-    try:
-        print("🔍 create_event hostname:", socket.gethostname(), "pid:", os.getpid(), "user_key_present:", bool(user_key))
-    except Exception:
-        pass
-    print("🔍 create_event user_key:", user_key)
-    print("🔍 Current MS_TOKEN_STORE keys:", list(MS_TOKEN_STORE.keys()))
-    if not user_key:
-        return JSONResponse({"error": "missing_user_key"}, status_code=400)
-    try:
-        start = body["start"]
-        end = body["end"]
-        subject = body.get("subject", "Meeting scheduled via AI scheduler")
-        attendees = body.get("attendees", [])  # list of emails
-        event_body = {
-            "subject": subject,
-            "body": {"contentType": "HTML", "content": body.get("body", "")},
-            "start": {"dateTime": start, "timeZone": LOCAL_TZ},
-            "end": {"dateTime": end, "timeZone": LOCAL_TZ},
-            "attendees": [{"emailAddress": {"address": a, "name": a.split("@")[0]}, "type": "required"} for a in attendees],
-            # create online meeting (Teams) — optional
-            "isOnlineMeeting": True,
-            "onlineMeetingProvider": "teamsForBusiness"
-        }
-        ev = ms_create_event(user_key, event_body)
-        return ev
-    except requests.HTTPError as he:
-        return JSONResponse({"error":"graph_error","detail": str(he), "response": getattr(he.response, "text", "")}, status_code=500)
-    except Exception as e:
-        return JSONResponse({"error":"server_error","detail": str(e)}, status_code=500)'''
-
 @app.post("/ms/graph/create_event")
 def ms_graph_create_event(body: dict = Body(...)):
     """
@@ -2554,3 +2520,35 @@ async def _export_ms_tokens(request: Request):
 
     # Return a copy (avoid leaking internal objects)
     return JSONResponse(MS_TOKEN_STORE)
+
+from fastapi.responses import HTMLResponse
+
+@app.get("/teams/google/close", response_class=HTMLResponse)
+def teams_google_close(next: str | None = None):
+    # If opened inside a Teams popup, the script will call notifySuccess and close.
+    # Otherwise (manual browser), it will redirect to `next` if provided.
+    next_js = urllib.parse.unquote(next) if next else "/ui/"
+    # sanitize next_js minimally - you can tighten checks if you want
+    return f"""
+    <!doctype html><html><head><meta charset="utf-8"></head><body>
+    <script>
+      (function() {{
+        try {{
+          // If opened by Teams popup, notify and close.
+          if (window.opener && window.opener.microsoftTeams) {{
+            window.opener.microsoftTeams.authentication.notifySuccess("connected");
+            window.close();
+            return;
+          }}
+        }} catch(e) {{
+          // fallthrough to redirect
+        }}
+        // Not a Teams popup -> redirect to original next (state)
+        window.location.replace("{next_js}");
+      }})();
+    </script>
+    <noscript>
+      Google connected. <a href="{next_js}">Continue</a>
+    </noscript>
+    </body></html>
+    """
