@@ -38,6 +38,7 @@
       <div class="controls">
         <button id="createBtn" class="btn-primary">Create event</button>
         <button id="connectMsBtn" class="btn-ghost">Connect Microsoft</button>
+        <button id="connectGoogleBtn" class="btn-ghost">Connect Google</button>
         <div id="status" class="small muted"></div>
       </div>
     </div>
@@ -280,6 +281,27 @@ createBtn.addEventListener('click', async ()=>{
 });
 
 fetchSuggestions();
+</script>
+<script src="https://res.cdn.office.net/teams-js/2.12.0/js/MicrosoftTeams.min.js"></script>
+<script>
+  microsoftTeams.app.initialize().then(() => {
+    const connectGoogleBtn = document.getElementById("connectGoogleBtn");
+    if (connectGoogleBtn) {
+      connectGoogleBtn.addEventListener("click", () => {
+        microsoftTeams.authentication.authenticate({
+          url: "https://ai-meeting-scheduler-zybz.onrender.com/auth/google",
+          width: 600,
+          height: 550,
+          successCallback: () => {
+            alert("Google account connected successfully!");
+          },
+          failureCallback: (reason) => {
+            alert("Google login failed: " + reason);
+          }
+        });
+      });
+    }
+  });
 </script>
 </body>
 </html>
