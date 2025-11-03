@@ -1194,62 +1194,93 @@ def auth_start(request: Request):
 from fastapi.responses import RedirectResponse, JSONResponse
 import urllib.parse
 
+from fastapi import Query
+from fastapi.responses import HTMLResponse
+
 @app.get("/auth/callback")
 async def auth_callback(code: str = Query(None), state: str | None = Query(None)):
     """
     Exchange code -> save credentials, then reply with a tiny HTML page
-    that postMessage()s success back to the opener (the Teams popup starter).
+    that notifies Teams (via microsoftTeams.authentication.notifySuccess/notifyFailure)
+    and then closes the popup. Falls back to window.opener.postMessage for non-Teams clients.
     """
-    if not code:
-        # return HTML that notifies failure to opener
-        html = """
-        <!doctype html><html><body>
-        <script>
-          try { if (window.opener) window.opener.postMessage({type:'ASH_AISCHED_AUTH_FAILURE', error:'missing_code'}, '*'); } catch(e){}
-          setTimeout(()=>window.close(),700);
-        </script>
-        <div>Auth failed: no code returned.</div>
-        </body></html>
-        """
-        return HTMLResponse(html, status_code=400)
-
-    # Exchange code for token (your existing code)
-    try:
-        flow = build_flow()           # keep your existing helper
-        flow.fetch_token(code=code)
-        creds = flow.credentials
-        save_creds(ORGANIZER_ID, creds)   # keep your existing helper which stores creds
-    except Exception as e:
-        # on error, post failure back to opener and show message
-        html = f"""
-        <!doctype html><html><body>
-        <script>
-          try {{ if (window.opener) window.opener.postMessage({{type:'ASH_AISCHED_AUTH_FAILURE', error:{repr(str(e))} }}, '*'); }} catch(e){{}}
-          setTimeout(()=>window.close(),700);
-        </script>
-        <div>Auth failed: server error.</div>
-        </body></html>
-        """
-        return HTMLResponse(html, status_code=500)
-
-    # success -> notify opener and close the system browser tab
-    # optionally return a small page that posts to opener
-    redirect_target = (state if state else "/")
-    html = f"""
-    <!doctype html><html><head><meta charset="utf-8"></head><body>
+    # HTML shown when no code returned
+    no_code_html = """<!doctype html>
+    <html><head><meta charset="utf-8"></head><body>
+    <script src="https://res.cdn.office.net/teams-js/2.12.0/js/MicrosoftTeams.min.js"></script>
     <script>
-      try {{
-        if (window.opener) {{
-          window.opener.postMessage({{ type: 'ASH_AISCHED_AUTH_SUCCESS' }}, '*');
-        }}
-      }} catch(e){{ console.error(e); }}
-      // close this browser tab/window after a short delay
-      setTimeout(()=>{{ window.close(); }}, 700);
+      (function(){
+        var error = { reason: 'missing_code' };
+        try {
+          if (window.microsoftTeams && microsoftTeams.authentication && microsoftTeams.authentication.notifyFailure) {
+            microsoftTeams.authentication.notifyFailure(JSON.stringify(error));
+          } else if (window.opener) {
+            try { window.opener.postMessage({ type: 'ASH_AISCHED_AUTH_FAILURE', payload: error }, '*'); } catch(e){}
+          }
+        } catch(e) { console.error(e); }
+        setTimeout(()=>{ try { window.close(); } catch(e){} }, 900);
+      })();
+    </script>
+    <div>Auth failed: no code returned.</div>
+    </body></html>"""
+
+    if not code:
+        return HTMLResponse(no_code_html, status_code=400)
+
+    # Try exchange + save
+    try:
+        flow = build_flow()            # your existing helper
+        flow.fetch_token(code=code)    # exchange code -> token
+        creds = flow.credentials
+        save_creds(ORGANIZER_ID, creds)   # your existing helper (persist credentials)
+    except Exception as e:
+        # Return HTML that notifies Teams of failure and closes window
+        # we intentionally do not echo raw exception to user; keep a small message
+        failure_html = f"""<!doctype html>
+        <html><head><meta charset="utf-8"></head><body>
+        <script src="https://res.cdn.office.net/teams-js/2.12.0/js/MicrosoftTeams.min.js"></script>
+        <script>
+          (function(){{
+            var error = {{ reason: 'server_error' }};
+            try {{
+              if (window.microsoftTeams && microsoftTeams.authentication && microsoftTeams.authentication.notifyFailure) {{
+                microsoftTeams.authentication.notifyFailure(JSON.stringify(error));
+              }} else if (window.opener) {{
+                try {{ window.opener.postMessage({{ type: 'ASH_AISCHED_AUTH_FAILURE', payload: error }}, '*'); }} catch(e){{}}
+              }}
+            }} catch(e){{ console.error(e); }}
+            setTimeout(()=>{{ try {{ window.close(); }} catch(e){{}} }}, 900);
+          }})();
+        </script>
+        <div>Auth failed: server error. You can close this window.</div>
+        </body></html>"""
+        # optionally log the exception server-side (use your logger); e.g. print(e) or logger.exception(e)
+        print("auth/callback error:", e)
+        return HTMLResponse(failure_html, status_code=500)
+
+    # Success HTML: notify Teams and close the popup
+    success_html = """<!doctype html>
+    <html><head><meta charset="utf-8"></head><body>
+    <script src="https://res.cdn.office.net/teams-js/2.12.0/js/MicrosoftTeams.min.js"></script>
+    <script>
+      (function(){
+        var payload = { connected: true };
+        try {
+          if (window.microsoftTeams && microsoftTeams.authentication && microsoftTeams.authentication.notifySuccess) {
+            microsoftTeams.authentication.notifySuccess(JSON.stringify(payload));
+          } else if (window.opener) {
+            try { window.opener.postMessage({ type: 'ASH_AISCHED_AUTH_SUCCESS', payload: payload }, '*'); } catch(e){}
+          }
+        } catch(e) {
+          console.error('notifySuccess failed', e);
+        }
+        setTimeout(()=>{ try { window.close(); } catch(e){} }, 700);
+      })();
     </script>
     <div>Sign-in complete. You can close this window and return to Teams.</div>
-    </body></html>
-    """
-    return HTMLResponse(html)
+    </body></html>"""
+
+    return HTMLResponse(success_html, status_code=200)
 
 
 

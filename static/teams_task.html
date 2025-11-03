@@ -220,10 +220,25 @@ function selectSlot(idx){
   showStatus('Selected slot: ' + (SUGGESTIONS[idx].human || (SUGGESTIONS[idx].start + ' → ' + SUGGESTIONS[idx].end)));
 }
 
-function openConnectMs(){
-  const next = encodeURIComponent(location.pathname + location.search);
-  window.location.href = API_BASE + '/ms/auth/start?next=' + next;
+
+function openConnectMs() {
+  const authUrl = API_BASE + '/ms/auth/start?next=' + encodeURIComponent(location.pathname + location.search);
+  microsoftTeams.authentication.authenticate({
+    url: authUrl,
+    width: 600,
+    height: 650,
+    successCallback: (result) => {
+      // called when server closes popup with notifySuccess/result
+      alert('Microsoft connected');
+      // reload UI if needed
+      location.reload();
+    },
+    failureCallback: (err) => {
+      alert('MS login failed: ' + (err || 'unknown'));
+    }
+  });
 }
+connectMsBtn.addEventListener('click', openConnectMs);
 
 connectMsBtn.addEventListener('click', openConnectMs);
 
