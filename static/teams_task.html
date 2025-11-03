@@ -289,7 +289,7 @@ fetchSuggestions();
     if (connectGoogleBtn) {
       connectGoogleBtn.addEventListener("click", () => {
         microsoftTeams.authentication.authenticate({
-          url: "https://ai-meeting-scheduler-zybz.onrender.com/auth/start",
+          url: "https://ai-meeting-scheduler-zybz.onrender.com/teams/google/start-popup",
           width: 600,
           height: 550,
           successCallback: () => {

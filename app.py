@@ -1195,18 +1195,62 @@ from fastapi.responses import RedirectResponse, JSONResponse
 import urllib.parse
 
 @app.get("/auth/callback")
-def auth_callback(code: str, state: str | None = None):
-    # exchange token and save creds (existing logic)
-    flow = build_flow()
-    flow.fetch_token(code=code)
-    creds = flow.credentials
-    save_creds(ORGANIZER_ID, creds)
+async def auth_callback(code: str = Query(None), state: str | None = Query(None)):
+    """
+    Exchange code -> save credentials, then reply with a tiny HTML page
+    that postMessage()s success back to the opener (the Teams popup starter).
+    """
+    if not code:
+        # return HTML that notifies failure to opener
+        html = """
+        <!doctype html><html><body>
+        <script>
+          try { if (window.opener) window.opener.postMessage({type:'ASH_AISCHED_AUTH_FAILURE', error:'missing_code'}, '*'); } catch(e){}
+          setTimeout(()=>window.close(),700);
+        </script>
+        <div>Auth failed: no code returned.</div>
+        </body></html>
+        """
+        return HTMLResponse(html, status_code=400)
 
-    # After saving tokens, redirect to a small page that will either:
-    #  - notify Teams and close the popup (if this was a Teams popup), or
-    #  - redirect the browser to the original 'state' (next) for non-Teams flows.
-    next_url = state or "/ui/"
-    return RedirectResponse(url=f"/teams/google/close?next={urllib.parse.quote(next_url, safe='')}")
+    # Exchange code for token (your existing code)
+    try:
+        flow = build_flow()           # keep your existing helper
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+        save_creds(ORGANIZER_ID, creds)   # keep your existing helper which stores creds
+    except Exception as e:
+        # on error, post failure back to opener and show message
+        html = f"""
+        <!doctype html><html><body>
+        <script>
+          try {{ if (window.opener) window.opener.postMessage({{type:'ASH_AISCHED_AUTH_FAILURE', error:{repr(str(e))} }}, '*'); }} catch(e){{}}
+          setTimeout(()=>window.close(),700);
+        </script>
+        <div>Auth failed: server error.</div>
+        </body></html>
+        """
+        return HTMLResponse(html, status_code=500)
+
+    # success -> notify opener and close the system browser tab
+    # optionally return a small page that posts to opener
+    redirect_target = (state if state else "/")
+    html = f"""
+    <!doctype html><html><head><meta charset="utf-8"></head><body>
+    <script>
+      try {{
+        if (window.opener) {{
+          window.opener.postMessage({{ type: 'ASH_AISCHED_AUTH_SUCCESS' }}, '*');
+        }}
+      }} catch(e){{ console.error(e); }}
+      // close this browser tab/window after a short delay
+      setTimeout(()=>{{ window.close(); }}, 700);
+    </script>
+    <div>Sign-in complete. You can close this window and return to Teams.</div>
+    </body></html>
+    """
+    return HTMLResponse(html)
+
 
 
 # Contacts
@@ -2055,23 +2099,28 @@ def get_mom(mom_id: str):
     return HTMLResponse(html)
 from fastapi import Query
 
-@app.get("/ms/auth/start")
-def ms_auth_start(next: str = "/ui/"):
+@app.get("/auth/start")
+async def auth_start(next: str | None = "/", json: int | None = Query(None)):
     """
-    Redirect user to Microsoft sign-in. `next` is optional redirect after success.
+    If called normally, redirect to Google OAuth (existing behavior).
+    If called with ?json=1, return JSON { url: "<full-google-oauth-url>" } so
+    the popup starter page can open it in the system browser.
     """
-    # state can carry the next url (simple approach)
-    state = urllib.parse.quote(next, safe="")
-    params = {
-        "client_id": MS_CLIENT_ID,
-        "response_type": "code",
-        "redirect_uri": MS_REDIRECT,
-        "response_mode": "query",
-        "scope": " ".join(MS_SCOPES),
-        "state": state
-    }
-    url = MS_AUTH_URL + "?" + urllib.parse.urlencode(params)
-    return RedirectResponse(url)
+    flow = build_flow()  # your existing helper that sets up oauth2 flow object
+    # build the google auth url (the same you used for redirect)
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+        state=next or '/'
+    )
+
+    if json:
+        return JSONResponse({"url": auth_url})
+
+    # otherwise do the original redirect (keep current behavior)
+    return RedirectResponse(auth_url)
+
 
 
 # Make sure MS_TOKEN_STORE exists at module scope:

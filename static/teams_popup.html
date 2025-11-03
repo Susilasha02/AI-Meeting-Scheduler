@@ -1,0 +1,60 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Connect Google — starting…</title>
+</head>
+<body>
+  <div>Opening Google sign-in… If a browser window didn't open, click <a id="open">here</a>.</div>
+<script>
+// Build the Google auth URL server-side or request it from /auth/start endpoint.
+// Simpler: call your backend /auth/start to return the full googleAuthUrl (recommended).
+async function getAuthUrl(){
+  // backend should return JSON: { url: "https://accounts.google.com/..." }
+  const res = await fetch('/auth/start?json=1', { credentials: 'include' });
+  const j = await res.json();
+  return j.url;
+}
+
+(async ()=>{
+  try {
+    const url = await getAuthUrl();
+    // open in new browser tab/window
+    const popup = window.open(url, '_blank', 'noopener');
+    if (!popup) {
+      // if blocked, give the user a link
+      const a = document.getElementById('open');
+      a.href = url;
+      a.style.display = 'inline';
+    }
+  } catch (e) {
+    console.error('failed to get auth url', e);
+    document.body.insertAdjacentHTML('beforeend', '<p>Error starting sign-in: '+e+'</p>');
+  }
+
+  // listen for postMessage from callback
+  window.addEventListener('message', function(ev){
+    try {
+      const m = ev.data || {};
+      if (m && m.type === 'ASH_AISCHED_AUTH_SUCCESS') {
+        // Notify Teams host that auth succeeded
+        if (window.microsoftTeams && window.microsoftTeams.authentication && window.microsoftTeams.authentication.notifySuccess) {
+          window.microsoftTeams.authentication.notifySuccess();
+        } else {
+          // fallback: use postMessage back to opener parent (if any)
+          // (some environments may not expose notifySuccess)
+          console.log('notifySuccess not available, closing after small delay');
+        }
+        // close this popup after a short delay so notifySuccess can be processed
+        setTimeout(()=>window.close(), 300);
+      } else if (m && m.type === 'ASH_AISCHED_AUTH_FAILURE') {
+        window.microsoftTeams && window.microsoftTeams.authentication && window.microsoftTeams.authentication.notifyFailure && window.microsoftTeams.authentication.notifyFailure(m.error || 'failure');
+        setTimeout(()=>window.close(),300);
+      }
+    } catch(err) { console.warn(err); }
+  }, false);
+
+})();
+</script>
+</body>
+</html>
