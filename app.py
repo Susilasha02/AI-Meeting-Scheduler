@@ -1,4 +1,3 @@
-# app.py (patched - weekday handling fixes)
 import os
 import json
 import re
@@ -354,19 +353,12 @@ SCOPES = [
 ]
 from google_auth_oauthlib.flow import Flow
 
-def build_flow():
-    # use your client config/credentials file as before
-    flow = Flow.from_client_config(CLIENT_FILE, scopes=SCOPES)
-    # IMPORTANT: set the exact redirect URI used in Google Cloud Console
-    flow.redirect_uri = "https://ai-meeting-scheduler-zybz.onrender.com/auth/callback"
-    return flow
-
-'''def build_flow() -> Flow:
+def build_flow() -> Flow:
     return Flow.from_client_secrets_file(
         CLIENT_FILE,
         scopes=SCOPES,
         redirect_uri=f"https://ai-meeting-scheduler-zybz.onrender.com/auth/callback",
-    )'''
+    )
 
 # --------- calendar helpers (Requests transport) ----------
 def _authed(creds: Credentials) -> AuthorizedSession:
