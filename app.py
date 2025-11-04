@@ -357,7 +357,7 @@ def build_flow() -> Flow:
     return Flow.from_client_secrets_file(
         CLIENT_FILE,
         scopes=SCOPES,
-        redirect_uri=f"{APP_BASE_URL}/auth/callback",
+        redirect_uri=f"https://ai-meeting-scheduler-zybz.onrender.com/auth/callback",
     )
 
 # --------- calendar helpers (Requests transport) ----------
@@ -1193,7 +1193,6 @@ def auth_start(request: Request):
         return JSONResponse({"error": "oauth_setup_failed", "detail": str(e)}, status_code=500)
 from fastapi.responses import RedirectResponse, JSONResponse
 import urllib.parse
-
 from fastapi import Query
 from fastapi.responses import HTMLResponse
 
@@ -1232,7 +1231,8 @@ async def auth_callback(code: str = Query(None), state: str | None = Query(None)
         flow = build_flow()            # your existing helper
         flow.fetch_token(code=code)    # exchange code -> token
         creds = flow.credentials
-        save_creds(ORGANIZER_ID, creds)   # your existing helper (persist credentials)
+        save_creds(ORGANIZER_ID, creds) 
+          # your existing helper (persist credentials)
     except Exception as e:
         # Return HTML that notifies Teams of failure and closes window
         # we intentionally do not echo raw exception to user; keep a small message
@@ -2156,7 +2156,9 @@ async def auth_start(next: str | None = "/", json: int | None = Query(None)):
 
 # Make sure MS_TOKEN_STORE exists at module scope:
 # MS_TOKEN_STORE = {}
+
 @app.get("/ms/auth/callback")
+
 def ms_auth_callback(code: str = Query(...), state: str | None = Query(None)):
     """
     Exchange code for tokens, fetch /me to identify user, store tokens in MS_TOKEN_STORE,
