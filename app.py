@@ -352,13 +352,21 @@ SCOPES = [
     "https://www.googleapis.com/auth/calendar.events",
     "https://www.googleapis.com/auth/calendar.readonly",
 ]
+from google_auth_oauthlib.flow import Flow
 
-def build_flow() -> Flow:
+def build_flow():
+    # use your client config/credentials file as before
+    flow = Flow.from_client_config(CLIENT_FILE, scopes=SCOPES)
+    # IMPORTANT: set the exact redirect URI used in Google Cloud Console
+    flow.redirect_uri = "https://ai-meeting-scheduler-zybz.onrender.com/auth/callback"
+    return flow
+
+'''def build_flow() -> Flow:
     return Flow.from_client_secrets_file(
         CLIENT_FILE,
         scopes=SCOPES,
         redirect_uri=f"https://ai-meeting-scheduler-zybz.onrender.com/auth/callback",
-    )
+    )'''
 
 # --------- calendar helpers (Requests transport) ----------
 def _authed(creds: Credentials) -> AuthorizedSession:
@@ -2157,17 +2165,29 @@ async def auth_start(next: str | None = "/", json: int | None = Query(None)):
 # Make sure MS_TOKEN_STORE exists at module scope:
 # MS_TOKEN_STORE = {}
 
-@app.get("/ms/auth/callback")
+import traceback
+from fastapi import Request
+from fastapi.responses import JSONResponse, RedirectResponse
 
-def ms_auth_callback(code: str = Query(...), state: str | None = Query(None)):
+@app.get("/ms/auth/callback")
+def ms_auth_callback(request: Request, code: str = Query(...), state: str | None = Query(None)):
     """
     Exchange code for tokens, fetch /me to identify user, store tokens in MS_TOKEN_STORE,
     then redirect back to `state` (next) and append user_key query param so UI knows which user is connected.
     """
+    # --- original debug lines kept ---
     print("🟣 [CALLBACK] hostname:", socket.gethostname(), "pid:", os.getpid())
-
-
     print("🟣 [CALLBACK] Entered Microsoft auth callback")
+
+    # --- new debug: raw incoming request info ---
+    try:
+        print("🟣 [CALLBACK] Raw query string:", request.url.query)
+        print("🟣 [CALLBACK] Full request URL:", str(request.url))
+        # print a few headers (don't print Authorization if present)
+        headers_sample = {k: v for k, v in list(request.headers.items())[:12]}
+        print("🟣 [CALLBACK] Request headers (sample):", headers_sample)
+    except Exception as e:
+        print("🔴 [CALLBACK] Failed to log request debug:", str(e))
 
     if not code:
         print("🔴 [CALLBACK] No code provided in callback")
@@ -2182,13 +2202,31 @@ def ms_auth_callback(code: str = Query(...), state: str | None = Query(None)):
         "grant_type": "authorization_code",
         "client_secret": MS_CLIENT_SECRET,
     }
+
+    # debug: show payload keys but mask secret
+    try:
+        masked_payload = dict(payload)
+        if "client_secret" in masked_payload:
+            masked_payload["client_secret"] = "****(hidden)****"
+        print("🟣 [CALLBACK] Token request payload preview:", {k: masked_payload.get(k) for k in masked_payload})
+    except Exception as e:
+        print("🔴 [CALLBACK] Failed to prepare payload debug:", str(e))
+
     try:
         r = requests.post(MS_TOKEN_URL, data=payload, timeout=10)
     except Exception as e:
         print("🔴 [CALLBACK] Token endpoint request failed:", str(e))
+        print(traceback.format_exc())
         return JSONResponse({"error": "ms_token_request_failed", "detail": str(e)}, status_code=500)
 
+    # debug: status + body preview
     print("🟣 [CALLBACK] Token endpoint status:", r.status_code)
+    try:
+        body_preview = r.text[:1000] if r.text else "<empty body>"
+        print("🟣 [CALLBACK] Token endpoint response preview (first 1000 chars):", body_preview)
+    except Exception:
+        print("🟣 [CALLBACK] Could not print token response body")
+
     if not r.ok:
         text = r.text if r is not None else "<no response body>"
         print("🔴 [CALLBACK] Token exchange failed:", text)
@@ -2198,6 +2236,8 @@ def ms_auth_callback(code: str = Query(...), state: str | None = Query(None)):
         token_resp = r.json()
     except Exception as e:
         print("🔴 [CALLBACK] Failed to parse token json:", str(e))
+        print("🔴 [CALLBACK] Raw token body:", r.text if r is not None else "<no body>")
+        print(traceback.format_exc())
         return JSONResponse({"error": "ms_token_parse_failed", "detail": str(e)}, status_code=500)
 
     print("🟢 [CALLBACK] Token response keys:", list(token_resp.keys()))
@@ -2215,9 +2255,13 @@ def ms_auth_callback(code: str = Query(...), state: str | None = Query(None)):
             user_email = (me.get("mail") or me.get("userPrincipalName") or None)
         else:
             # log the error body for debugging
-            print("🔴 [CALLBACK] /me returned non-OK:", me_resp.text)
+            try:
+                print("🔴 [CALLBACK] /me returned non-OK:", me_resp.text[:1000])
+            except Exception:
+                print("🔴 [CALLBACK] /me returned non-OK and could not read body")
     except Exception as e:
         print("🔴 [CALLBACK] Error fetching /me:", str(e))
+        print(traceback.format_exc())
 
     if not user_email:
         # fallback to a generic key but still save tokens
@@ -2239,97 +2283,32 @@ def ms_auth_callback(code: str = Query(...), state: str | None = Query(None)):
         "refresh_token": token_resp.get("refresh_token"),
         "expires_at": expires_at,
     }
-    
-    # ---------- Persist & populate token under multiple candidate keys ----------
-    def _derive_ms_candidate_keys_from_callback(primary_key: str, me_obj: dict | None):
-        """
-        Derive plausible alternative keys from the callback-determined primary_key and /me info.
-        Examples handled generically and without hardcoding:
-          - the original user_key
-          - mail (if present)
-          - userPrincipalName (if present)
-          - left part of UPN if '#ext#' present
-          - reconstructed email if left part looks like 'local_domain.com' (keeps digits)
-          - any email found in angle brackets
-        """
-        keys = []
-        pk = (primary_key or "").strip().lower()
-        if pk:
-            keys.append(pk)
 
-        if me_obj:
-            mail = (me_obj.get("mail") or "").strip().lower()
-            upn  = (me_obj.get("userPrincipalName") or "").strip().lower()
-            if mail and mail not in keys:
-                keys.append(mail)
-            if upn and upn not in keys:
-                keys.append(upn)
-
-        # handle guest UPNs with '#ext#' -> try left side and reconstruct email by last underscore
-        if "#ext#" in pk:
-            left = pk.split("#ext#", 1)[0]
-            if left and left not in keys:
-                keys.append(left)
-            m = re.match(r"^(.+)_([a-z0-9.\-]+\.[a-z]{2,})$", left)
-            if m:
-                probable = f"{m.group(1)}@{m.group(2)}"
-                if probable not in keys:
-                    keys.append(probable)
-
-        # extract email from angle-bracket patterns if present
-        m2 = re.search(r"<([^>]+@[^>]+)>", primary_key)
-        if m2:
-            candidate = m2.group(1).strip().lower()
-            if candidate not in keys:
-                keys.append(candidate)
-
-        return keys
-
-    candidate_keys = _derive_ms_candidate_keys_from_callback(user_key, me)
-
-    saved_any = []
-    for k in candidate_keys:
-        try:
-            # Persist raw token response under ms_tokens -> ms_save_token will write to TOKEN_STORE
-            ms_save_token(k, token_resp)
-            # keep the in-memory copy too for immediate use
-            MS_TOKEN_STORE[k] = {
-                "access_token": token_resp.get("access_token"),
-                "refresh_token": token_resp.get("refresh_token"),
-                "expires_at": expires_at
-            }
-            saved_any.append(k)
-            print(f"🟢 [CALLBACK] Saved MS token under key: {k}")
-        except Exception as e:
-            print(f"⚠️ [CALLBACK] Failed to save token under {k}: {e}")
-
-    if not saved_any:
-        # fallback to at least set in-memory so current flow might succeed
+    # --- save token into MS_TOKEN_STORE (existing behavior) ---
+    try:
+        # create MS_TOKEN_STORE if missing
+        if "MS_TOKEN_STORE" not in globals():
+            # fallback to in-memory store if not defined elsewhere
+            globals()["MS_TOKEN_STORE"] = {}
         MS_TOKEN_STORE[user_key] = token_entry
-        print(f"⚠️ [CALLBACK] Persist attempts failed; kept token in-memory under {user_key}")
+        print("🟢 [CALLBACK] Token saved into MS_TOKEN_STORE for user_key:", user_key)
+    except Exception as e:
+        print("🔴 [CALLBACK] Failed to save token entry:", str(e))
+        print(traceback.format_exc())
+        # still continue to redirect back so UI can handle it
+    # --- compute redirect back to UI with user_key param ---
+    try:
+        redirect_target = state if state else "/"
+        # append user_key param correctly
+        sep = "&" if "?" in redirect_target else "?"
+        redirect_url = f"{redirect_target}{sep}user_key={requests.utils.requote_uri(user_key)}"
+        print("🟣 [CALLBACK] Redirecting back to:", redirect_url)
+        return RedirectResponse(redirect_url)
+    except Exception as e:
+        print("🔴 [CALLBACK] Failed to build redirect response:", str(e))
+        print(traceback.format_exc())
+        return JSONResponse({"error": "redirect_failed", "detail": str(e)}, status_code=500)
 
-    print("✅ [CALLBACK] Current MS_TOKEN_STORE keys:", list(MS_TOKEN_STORE.keys()))
-    # -------------------------------------------------------------------------
-
-    # build redirect back URL (state contains 'next' originally)
-    next_url = urllib.parse.unquote(state) if state else "/ui/"
-    # append user_key so UI knows user is connected (preserve existing query params)
-    parsed = urllib.parse.urlparse(next_url)
-    qs = urllib.parse.parse_qs(parsed.query)
-    qs["user_key"] = [user_key]
-    new_qs = urllib.parse.urlencode(qs, doseq=True)
-    rebuilt = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_qs, parsed.fragment))
-
-    # If `state` lacked scheme/netloc (was relative), ensure we return relative if appropriate.
-    # Prefer returning absolute URL if original `state` was absolute; else return relative path.
-    if parsed.scheme == "" and parsed.netloc == "":
-        # relative path - keep relative
-        redirect_target = parsed.path + ("?" + new_qs if new_qs else "")
-    else:
-        redirect_target = rebuilt
-
-    print("🟣 [CALLBACK] Redirecting back to:", redirect_target)
-    return RedirectResponse(redirect_target)
 
 def ms_create_event(user_key: str, event_body: dict):
     """
