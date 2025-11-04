@@ -299,24 +299,18 @@ fetchSuggestions();
 </script>
 <script src="https://res.cdn.office.net/teams-js/2.12.0/js/MicrosoftTeams.min.js"></script>
 <script>
+  // Initialize Teams SDK but use a plain redirect for Google so the user returns to the main UI.
   microsoftTeams.app.initialize().then(() => {
     const connectGoogleBtn = document.getElementById("connectGoogleBtn");
     if (connectGoogleBtn) {
       connectGoogleBtn.addEventListener("click", () => {
-        microsoftTeams.authentication.authenticate({
-          url: "https://ai-meeting-scheduler-zybz.onrender.com/teams/google/start-popup",
-          width: 600,
-          height: 550,
-          successCallback: () => {
-            alert("Google account connected successfully!");
-          },
-          failureCallback: (reason) => {
-            alert("Google login failed: " + reason);
-          }
-        });
+        // Redirect to the server endpoint that starts Google OAuth in the same browser tab.
+        // The server should redirect back to /ui/ (or the state you pass) after sign-in.
+        window.location.href = API_BASE + '/auth/start?next=' + encodeURIComponent('/ui/');
       });
     }
   });
 </script>
+
 </body>
 </html>

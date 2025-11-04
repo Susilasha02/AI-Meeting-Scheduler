@@ -1195,7 +1195,7 @@ from fastapi.responses import RedirectResponse, JSONResponse
 import urllib.parse
 from fastapi import Query
 from fastapi.responses import HTMLResponse
-
+'''
 @app.get("/auth/callback")
 async def auth_callback(code: str = Query(None), state: str | None = Query(None)):
     """
@@ -1280,8 +1280,46 @@ async def auth_callback(code: str = Query(None), state: str | None = Query(None)
     <div>Sign-in complete. You can close this window and return to Teams.</div>
     </body></html>"""
 
-    return HTMLResponse(success_html, status_code=200)
+    return HTMLResponse(success_html, status_code=200)'''
 
+@app.get("/auth/callback")
+async def auth_callback(code: str = Query(None), state: str | None = Query(None)):
+    """
+    Revert to simple redirect UX:
+    Exchange code -> save credentials -> redirect back to 'state' or /ui/
+    """
+    # No code => friendly page
+    if not code:
+        return HTMLResponse("""
+            <!doctype html><html><body>
+            <div style="font-family:system-ui,Segoe UI,Roboto,Arial;margin:18px;">
+              <h3>Auth failed: no code returned.</h3>
+              <p>Please close this window and try connecting again from the app.</p>
+            </div>
+            </body></html>
+        """, status_code=400)
+
+    # Exchange code -> token and save credentials
+    try:
+        flow = build_flow()           # your existing helper
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+        save_creds(ORGANIZER_ID, creds)   # your existing persistence helper
+    except Exception as e:
+        # log server-side as you currently do (don't reveal secrets)
+        print("auth/callback token exchange error:", e)
+        return HTMLResponse(f"""
+            <!doctype html><html><body>
+            <div style="font-family:system-ui,Segoe UI,Roboto,Arial;margin:18px;">
+              <h3>Auth failed: server error.</h3>
+              <p>Please close this window and retry later.</p>
+            </div>
+            </body></html>
+        """, status_code=500)
+
+    # Success: redirect back to UI or the state target
+    redirect_target = state if state else "/ui/"
+    return RedirectResponse(url=redirect_target)
 
 
 # Contacts
@@ -2128,31 +2166,21 @@ def get_mom(mom_id: str):
         participants_html = parts_html
     )
     return HTMLResponse(html)
-from fastapi import Query
 
 @app.get("/auth/start")
-async def auth_start(next: str | None = "/", json: int | None = Query(None)):
+async def auth_start(next: str | None = "/"):
     """
-    If called normally, redirect to Google OAuth (existing behavior).
-    If called with ?json=1, return JSON { url: "<full-google-oauth-url>" } so
-    the popup starter page can open it in the system browser.
+    Start Google OAuth by redirecting directly to Google's auth URL.
+    Keeps original behavior where user signs in in the same browser tab.
     """
-    flow = build_flow()  # your existing helper that sets up oauth2 flow object
-    # build the google auth url (the same you used for redirect)
+    flow = build_flow()  # your existing function
     auth_url, _ = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
         prompt="consent",
         state=next or '/'
     )
-
-    if json:
-        return JSONResponse({"url": auth_url})
-
-    # otherwise do the original redirect (keep current behavior)
     return RedirectResponse(auth_url)
-
-
 
 # Make sure MS_TOKEN_STORE exists at module scope:
 # MS_TOKEN_STORE = {}
